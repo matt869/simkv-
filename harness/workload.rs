@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 
 pub const TIMER_REQUEST: TimerTag = 1;
 pub const TIMER_THINK: TimerTag = 2;
+pub const TIMER_RETRY: TimerTag = 3;
 
 #[derive(Clone, Debug)]
 pub struct WorkloadConfig {
@@ -42,6 +43,10 @@ pub struct WorkloadConfig {
     pub think_time: (Nanos, Nanos),
     /// How long to wait for a reply before trying another server.
     pub request_timeout: Nanos,
+    /// Pause before retrying after a redirect. Without it a client burns every
+    /// attempt in a few milliseconds while an election is still running, and
+    /// abandons work the cluster was about to be able to do.
+    pub retry_backoff: (Nanos, Nanos),
     /// Attempts before the client gives up and records an unknown outcome.
     pub max_attempts: u32,
 }
@@ -56,7 +61,8 @@ impl Default for WorkloadConfig {
             keys: 6,
             think_time: (MILLIS, 20 * MILLIS),
             request_timeout: 500 * MILLIS,
-            max_attempts: 12,
+            retry_backoff: (10 * MILLIS, 80 * MILLIS),
+            max_attempts: 15,
         }
     }
 }
@@ -94,6 +100,9 @@ pub struct Client {
     next_req_id: u64,
     next_history_id: u64,
     inflight: Option<InFlight>,
+    /// Set while waiting out a retry backoff, so a stray timer cannot fire a
+    /// second copy of the same attempt.
+    backing_off: bool,
     /// The last value this client believes each key holds, used to make `cas`
     /// attempts that sometimes succeed.
     known: BTreeMap<String, Option<String>>,
@@ -122,6 +131,7 @@ impl Client {
             next_req_id: 1,
             next_history_id: 1,
             inflight: None,
+            backing_off: false,
             known: BTreeMap::new(),
             rng,
             cfg,
@@ -161,6 +171,7 @@ impl Client {
         if self.stopped || self.inflight.is_some() {
             return;
         }
+        self.backing_off = false;
         let op = self.pick_op();
         self.seq += 1;
         let history_id = self.next_history_id;
@@ -258,16 +269,25 @@ impl Client {
             }
             _ => self.rotate_target(),
         }
-        self.retry(io, history, now);
+        let backoff = self
+            .rng
+            .range(self.cfg.retry_backoff.0, self.cfg.retry_backoff.1);
+        self.retry(io, history, now, backoff);
     }
 
     pub fn on_timer(&mut self, io: &mut dyn Io, history: &mut History, now: Nanos, tag: TimerTag) {
         match tag {
             TIMER_REQUEST => {
-                if self.inflight.is_some() {
+                if self.inflight.is_some() && !self.backing_off {
                     // The server may be down, partitioned away, or simply slow.
                     self.rotate_target();
-                    self.retry(io, history, now);
+                    self.retry(io, history, now, 0);
+                }
+            }
+            TIMER_RETRY => {
+                if self.backing_off && self.inflight.is_some() {
+                    self.backing_off = false;
+                    self.attempt(io);
                 }
             }
             TIMER_THINK => self.begin(io, history, now),
@@ -275,7 +295,10 @@ impl Client {
         }
     }
 
-    fn retry(&mut self, io: &mut dyn Io, history: &mut History, now: Nanos) {
+    /// Try again after `delay`. A delay of zero retries immediately, which is
+    /// right after a timeout (the waiting has already happened) but wrong after
+    /// a redirect.
+    fn retry(&mut self, io: &mut dyn Io, history: &mut History, now: Nanos, delay: Nanos) {
         let Some(f) = self.inflight.as_mut() else {
             return;
         };
@@ -296,23 +319,30 @@ impl Client {
             return;
         }
         self.stats.retries += 1;
-        self.attempt(io);
+        if delay == 0 {
+            self.attempt(io);
+        } else {
+            self.backing_off = true;
+            io.set_timer(delay, TIMER_RETRY);
+        }
     }
 
     fn finish(&mut self, io: &mut dyn Io, history: &mut History, now: Nanos, outcome: Outcome) {
         let Some(f) = self.inflight.take() else {
             return;
         };
+        self.backing_off = false;
         if let Some(h) = f.timer {
             io.cancel_timer(h);
         }
         self.stats.completed += 1;
         self.remember(&f.op, &outcome);
         let id = (self.id as u64) << 32 | f.history_id;
-        debug_assert!(
-            history.complete(id, now, outcome.clone()),
-            "reply for an operation the history never recorded"
-        );
+        // Never inside a debug_assert!: its argument is not evaluated in
+        // release builds, which would silently stop the history being recorded
+        // at all -- and an empty history is trivially linearizable.
+        let recorded = history.complete(id, now, outcome.clone());
+        debug_assert!(recorded, "reply for an operation the history never recorded");
         io.trace(
             Level::Debug,
             "client",

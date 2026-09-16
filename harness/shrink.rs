@@ -96,9 +96,20 @@ pub fn describe(cfg: &SimConfig) -> String {
     if cfg.disk.reorder_unsynced {
         disk.push("reorder-unsynced".into());
     }
+    let w = &cfg.workload;
+    let mix: Vec<String> = [
+        ("read", w.read_weight),
+        ("write", w.write_weight),
+        ("cas", w.cas_weight),
+        ("delete", w.delete_weight),
+    ]
+    .iter()
+    .filter(|(_, weight)| *weight > 0)
+    .map(|(name, weight)| format!("{name}:{weight}"))
+    .collect();
     format!(
         "  seed={} servers={} clients={} keys={} duration={}ms settle={}ms\n  \
-         faults=[{}]\n  net=[{}]\n  disk=[{}]",
+         faults=[{}]\n  net=[{}]\n  disk=[{}]\n  workload=[{}]",
         cfg.seed,
         cfg.servers,
         cfg.clients,
@@ -108,6 +119,7 @@ pub fn describe(cfg: &SimConfig) -> String {
         faults.join(", "),
         net.join(", "),
         disk.join(", "),
+        mix.join(", "),
     )
 }
 
@@ -407,6 +419,7 @@ mod tests {
         assert!(d.contains("crashes"));
         assert!(d.contains("partitions"));
         assert!(d.contains("torn="));
+        assert!(d.contains("cas:"), "the op mix belongs in a repro description");
     }
 
     #[test]
