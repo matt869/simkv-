@@ -51,7 +51,7 @@ pub struct Cluster {
 
     /// Each node's log immediately before it crashed, so recovery can be
     /// checked for having produced a prefix of it.
-    pre_crash_log: BTreeMap<NodeId, Vec<Entry>>,
+    pre_crash_log: BTreeMap<NodeId, (Vec<Entry>, u64)>,
     /// Highest term each node has been seen to send a message in.
     acted_term: BTreeMap<NodeId, u64>,
     /// Stand-in log for a node that is currently down.
@@ -140,6 +140,9 @@ impl Cluster {
             self.reap_failed();
             if self.events % self.cfg.check_every == 0 {
                 self.check_invariants();
+            }
+            if self.events % self.cfg.check_durability_every == 0 {
+                self.check_durable_claims();
             }
         }
         self.check_invariants();
@@ -343,8 +346,15 @@ impl Cluster {
             return;
         }
         if let Some(server) = &self.servers[node.idx()] {
-            self.pre_crash_log
-                .insert(node, server.raft.log().entries().to_vec());
+            // Remember both the log and how much of it the node believed was
+            // synced: that is the part recovery is obliged to bring back.
+            self.pre_crash_log.insert(
+                node,
+                (
+                    server.raft.log().entries().to_vec(),
+                    server.raft.durable_index(),
+                ),
+            );
         }
         self.servers[node.idx()] = None;
         self.world.crash_node(node);
@@ -362,12 +372,11 @@ impl Cluster {
         let mut io = SimIo::new(&mut self.world, node);
         let server = KvServer::recover(&mut io, node, members, raft_cfg, seed);
 
-        // What came back must be a prefix of what was there before the crash.
-        if let Some(before) = self.pre_crash_log.get(&node) {
+        // Everything this node had synced must have come back unchanged.
+        if let Some((before, durable)) = self.pre_crash_log.get(&node) {
             let after = server.raft.log().entries();
-            self.report.extend(durability::check_recovery_is_a_prefix(
-                now, node, before, after,
-            ));
+            self.report
+                .extend(durability::check_recovery(now, node, before, *durable, after));
         }
         // And the disk must not have forgotten a term this node acted on.
         if let Some(acted) = self.acted_term.get(&node).copied() {
@@ -405,6 +414,33 @@ impl Cluster {
 
     fn is_client(&self, node: NodeId) -> bool {
         node.idx() >= self.cfg.servers
+    }
+
+    /// Verify every live node's durability claim against the bytes that would
+    /// actually survive a power cut.
+    fn check_durable_claims(&mut self) {
+        let now = self.world.now();
+        for i in 0..self.cfg.servers {
+            let node = NodeId(i as u32);
+            if !self.world.is_up(node) {
+                continue;
+            }
+            let Some(server) = &self.servers[i] else {
+                continue;
+            };
+            let disk = DiskView {
+                id: node,
+                bytes: self.world.durable_image(node, FILE_WAL),
+            };
+            let found = durability::check_durable_claim(
+                now,
+                node,
+                server.raft.log().entries(),
+                server.raft.durable_index(),
+                &disk,
+            );
+            self.report.extend(found);
+        }
     }
 
     fn check_invariants(&mut self) {
@@ -474,10 +510,10 @@ impl Cluster {
             .filter_map(|index| {
                 self.invariants
                     .committed_entry(index)
-                    .map(|(term, cmd)| CommittedEntry {
+                    .map(|rec| CommittedEntry {
                         index,
-                        term: *term,
-                        cmd: cmd.clone(),
+                        term: rec.term,
+                        cmd: rec.cmd.clone(),
                     })
             })
             .collect();

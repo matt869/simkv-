@@ -84,27 +84,16 @@ pub fn check_committed_durable(
         disks.iter().map(|d| (d.id, recover(&d.bytes))).collect();
 
     for c in committed {
-        let mut holders = 0;
-        for (id, r) in &recovered {
-            match r.get(c.index) {
-                None => {}
-                Some(e) if e.term == c.term && e.cmd == c.cmd => holders += 1,
-                Some(e) => {
-                    // A durable entry that contradicts a committed one is worse
-                    // than a missing one: this node would come back with a log
-                    // that disagrees about settled history.
-                    out.push(Violation::new(
-                        "durable_conflict",
-                        time,
-                        Some(*id),
-                        format!(
-                            "durable index {} is term {} {:?}, but term {} {:?} is committed",
-                            c.index, e.term, e.cmd, c.term, c.cmd
-                        ),
-                    ));
-                }
-            }
-        }
+        // Only an exact match counts. A node whose disk holds something *else*
+        // at this index is not a holder -- but it is not a violation on its own
+        // either: a lost truncation can leave a stale uncommitted entry behind,
+        // and the leader will overwrite it again on recovery. What matters is
+        // whether enough nodes hold the real thing, which is what is checked
+        // below.
+        let holders = recovered
+            .iter()
+            .filter(|(_, r)| r.get(c.index).is_some_and(|e| e.term == c.term && e.cmd == c.cmd))
+            .count();
         if holders < quorum {
             out.push(Violation::new(
                 "committed_not_durable",
@@ -123,46 +112,107 @@ pub fn check_committed_durable(
     out
 }
 
-/// Check that a restarted node recovered a prefix of what it had before the
-/// crash.
+/// Check that a restarted node still has everything it had made durable.
 ///
-/// A crash may lose the unsynced tail. It may never invent an entry, change one
-/// that was already there, or come back with a *longer* log than it had.
-pub fn check_recovery_is_a_prefix(
+/// The right yardstick is the node's own `durable_index` at the moment it
+/// crashed: every entry up to there was covered by a completed `fsync`, so it
+/// must come back unchanged. That is a real guarantee, and losing one of those
+/// entries is a genuine data-loss bug.
+///
+/// Beyond that point, anything is legal. The unsynced tail may be lost; a
+/// truncation whose `set_len` never reached the platter may resurrect entries
+/// the node had already discarded, leaving it with a *longer* log than it had
+/// in memory. That looks alarming and is harmless: those entries were never
+/// committed (a truncation only ever removes uncommitted entries), their terms
+/// are older than whatever replaced them, so the election restriction stops
+/// them winning anything, and the current leader will overwrite them again.
+pub fn check_recovery(
     time: Nanos,
     node: NodeId,
     before: &[Entry],
+    durable_index: u64,
     after: &[Entry],
 ) -> Vec<Violation> {
     let mut out = Vec::new();
-    if after.len() > before.len() {
+    let promised = durable_index.min(before.len() as u64);
+    if (after.len() as u64) < promised {
         out.push(Violation::new(
-            "recovery_grew",
+            "durable_entry_lost",
             time,
             Some(node),
             format!(
-                "recovered {} entries after a crash but only had {}",
-                after.len(),
-                before.len()
+                "recovered only {} entries, but {promised} had been synced before the crash",
+                after.len()
             ),
         ));
         return out;
     }
-    for (i, e) in after.iter().enumerate() {
-        if *e != before[i] {
+    for i in 0..promised as usize {
+        if after[i] != before[i] {
             out.push(Violation::new(
-                "recovery_not_a_prefix",
+                "durable_entry_changed",
                 time,
                 Some(node),
                 format!(
-                    "index {} recovered as term {} {:?}, but was term {} {:?} before the crash",
-                    e.index, e.term, e.cmd, before[i].term, before[i].cmd
+                    "index {} was synced as term {} {:?} but recovered as term {} {:?}",
+                    before[i].index, before[i].term, before[i].cmd, after[i].term, after[i].cmd
                 ),
             ));
             break;
         }
     }
     out
+}
+
+/// Check a live node's durability claim against its actual disk.
+///
+/// `durable_index` is the node's own belief about how much of its log is on
+/// stable storage, and it is the number it reports to its leader -- so commits
+/// are built on it. This decodes the bytes that would survive a power cut right
+/// now and checks that the belief is backed by them.
+///
+/// This is the check that catches a persistence discipline that is subtly out
+/// of order: acknowledging before the `fsync` completes, letting a later write
+/// overwrite a synced region, or raising the claim after a truncation has
+/// invalidated it.
+pub fn check_durable_claim(
+    time: Nanos,
+    node: NodeId,
+    log: &[Entry],
+    durable_index: u64,
+    disk: &DiskView,
+) -> Vec<Violation> {
+    if durable_index == 0 {
+        return Vec::new();
+    }
+    let r = recover(&disk.bytes);
+    if r.last_index() < durable_index {
+        return vec![Violation::new(
+            "durable_claim_unbacked",
+            time,
+            Some(node),
+            format!(
+                "claims {durable_index} entries are durable, but the disk would recover only {}",
+                r.last_index()
+            ),
+        )];
+    }
+    for i in 0..(durable_index as usize).min(log.len()) {
+        let on_disk = &r.entries[i];
+        if *on_disk != log[i] {
+            return vec![Violation::new(
+                "durable_claim_unbacked",
+                time,
+                Some(node),
+                format!(
+                    "index {} is term {} {:?} in memory but term {} {:?} on disk, \
+                     inside the range claimed durable ({durable_index})",
+                    log[i].index, log[i].term, log[i].cmd, on_disk.term, on_disk.cmd
+                ),
+            )];
+        }
+    }
+    Vec::new()
 }
 
 /// Check that a node's durable term never goes backwards.
@@ -333,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn a_durable_entry_contradicting_a_committed_one_is_caught() {
+    fn a_disagreeing_disk_does_not_count_towards_the_quorum() {
         let good = vec![entry(1, 1), entry(2, 1)];
         let mut bad = good.clone();
         bad[1] = Entry {
@@ -341,32 +391,46 @@ mod tests {
             index: 2,
             cmd: cmd(99),
         };
-        let disks = vec![disk(0, 1, &good), disk(1, 1, &good), disk(2, 2, &bad)];
+        // One node disagrees at index 2, but the other two hold it: safe.
+        let disks = vec![disk(0, 2, &good), disk(1, 2, &good), disk(2, 2, &bad)];
+        assert!(check_committed_durable(0, &committed(&good), &disks, 3).is_empty());
+
+        // Two disagree, so the committed entry is no longer on a majority.
+        let disks = vec![disk(0, 2, &good), disk(1, 2, &bad), disk(2, 2, &bad)];
         let v = check_committed_durable(0, &committed(&good), &disks, 3);
-        assert!(v.iter().any(|x| x.kind == "durable_conflict"), "got {v:?}");
+        assert_eq!(v[0].kind, "committed_not_durable");
     }
 
     #[test]
     fn losing_the_unsynced_tail_is_legal_recovery() {
         let before = vec![entry(1, 1), entry(2, 1), entry(3, 1)];
-        let after = &before[..1];
-        assert!(check_recovery_is_a_prefix(0, NodeId(0), &before, after).is_empty());
+        // Only the first entry was synced, so only it has to come back.
+        assert!(check_recovery(0, NodeId(0), &before, 1, &before[..1]).is_empty());
     }
 
     #[test]
-    fn recovering_a_changed_entry_is_caught() {
+    fn losing_a_synced_entry_is_caught() {
+        let before = vec![entry(1, 1), entry(2, 1), entry(3, 1)];
+        let v = check_recovery(0, NodeId(0), &before, 3, &before[..2]);
+        assert_eq!(v[0].kind, "durable_entry_lost");
+    }
+
+    #[test]
+    fn changing_a_synced_entry_is_caught() {
         let before = vec![entry(1, 1), entry(2, 1)];
         let after = vec![entry(1, 1), Entry { term: 5, index: 2, cmd: cmd(2) }];
-        let v = check_recovery_is_a_prefix(0, NodeId(0), &before, &after);
-        assert_eq!(v[0].kind, "recovery_not_a_prefix");
+        let v = check_recovery(0, NodeId(0), &before, 2, &after);
+        assert_eq!(v[0].kind, "durable_entry_changed");
     }
 
     #[test]
-    fn recovering_more_than_was_there_is_caught() {
+    fn a_lost_truncation_may_resurrect_uncommitted_entries() {
+        // The node truncated to one entry in memory, but the set_len never
+        // reached the platter, so the old tail came back. Unsynced, uncommitted
+        // and harmless: not a violation.
         let before = vec![entry(1, 1)];
-        let after = vec![entry(1, 1), entry(2, 1)];
-        let v = check_recovery_is_a_prefix(0, NodeId(0), &before, &after);
-        assert_eq!(v[0].kind, "recovery_grew");
+        let after = vec![entry(1, 1), entry(2, 1), entry(3, 1)];
+        assert!(check_recovery(0, NodeId(0), &before, 1, &after).is_empty());
     }
 
     #[test]

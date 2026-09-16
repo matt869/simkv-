@@ -219,10 +219,16 @@ enum Persist {
     VoteReply { to: NodeId, term: u64, granted: bool },
     /// The log is durable through `index`.
     LogDurable {
+        /// First index this batch actually wrote. Entries below it were
+        /// written by earlier batches, so this batch can only vouch for the
+        /// whole prefix if those batches confirmed first.
+        from: u64,
         index: u64,
         reply_to: Option<NodeId>,
         reply_term: u64,
     },
+    /// Hard state is durable; the message may now be sent.
+    Reply { to: NodeId, msg: RaftMsg },
     /// Hard state is durable; nothing to say about it.
     Quiet,
 }
@@ -373,6 +379,10 @@ pub struct Raft {
 
     /// Highest log index this node knows to be on stable storage.
     durable_index: u64,
+    /// Synced ranges that cannot be claimed yet because an earlier range has
+    /// not been confirmed. Writes are pipelined, so a later batch routinely
+    /// finishes first; its range waits here until the gap below it closes.
+    parked: Vec<(u64, u64)>,
     /// Sequence number for the next hard-state slot write.
     state_seq: u64,
 
@@ -396,6 +406,8 @@ impl Raft {
             &[][..]
         };
         let recovered = recover_log(log_bytes);
+        let records_read = recovered.entries.len();
+        let valid_bytes = recovered.valid_bytes;
         let mut entries = recovered.entries;
 
         // Entries whose term exceeds the durable term were never acknowledged:
@@ -430,6 +442,7 @@ impl Raft {
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
             durable_index,
+            parked: Vec::new(),
             state_seq: hs.seq + 1,
             persister: Persister::default(),
             election_timer: Deadline::new(),
@@ -443,12 +456,19 @@ impl Raft {
             Level::Info,
             "raft",
             format!(
-                "recovered term={} vote={:?} log={} durable={} damaged={}",
+                "recovered term={} vote={:?} log={} durable={} damaged={} \
+                 (file={}B, log region={}B, {} records read, {} valid bytes, \
+                 {} dropped ahead of term)",
                 raft.term,
                 raft.voted_for.map(|n| n.0),
                 raft.log.last_index(),
                 durable_index,
-                damaged
+                damaged,
+                bytes.len(),
+                log_bytes.len(),
+                records_read,
+                valid_bytes,
+                dropped_ahead_of_term,
             ),
         );
         raft.reset_election_timer(io);
@@ -848,10 +868,17 @@ impl Raft {
                 ),
             );
             if dirty {
-                let batch = self.persister.start(Persist::Quiet);
+                // The rejection carries the new term, so it is a public
+                // statement that this node has moved to it. Sending it before
+                // the term is on disk lets a crash bring the node back at the
+                // old term having already acted in the new one -- which is how
+                // a node ends up casting a second vote in a term it already
+                // voted in.
+                let batch = self.persister.start(Persist::Reply { to: from, msg: reply });
                 self.write_hard_state(io, batch);
+            } else {
+                self.send(io, from, reply);
             }
-            self.send(io, from, reply);
             return;
         }
 
@@ -890,6 +917,7 @@ impl Raft {
                 // Same batch as the entries: one sync orders the term update
                 // ahead of the entries it authorises.
                 let batch = self.persister.start(Persist::LogDurable {
+                    from: start,
                     index: self.log.last_index(),
                     reply_to: Some(from),
                     reply_term: self.term,
@@ -901,6 +929,7 @@ impl Raft {
             }
         } else if dirty {
             let batch = self.persister.start(Persist::LogDurable {
+                from: self.durable_index + 1,
                 index: self.durable_index,
                 reply_to: Some(from),
                 reply_term: self.term,
@@ -965,6 +994,11 @@ impl Raft {
         let cap = at - 1;
         self.durable_index = self.durable_index.min(cap);
         self.persister.clamp_all(cap);
+        // Parked ranges describe bytes that have just been replaced.
+        self.parked.retain(|(from, _)| *from <= cap);
+        for (_, to) in &mut self.parked {
+            *to = (*to).min(cap);
+        }
     }
 
     fn on_append_resp(
@@ -1081,6 +1115,7 @@ impl Raft {
         reply_term: u64,
     ) {
         let batch = self.persister.start(Persist::LogDurable {
+            from,
             index: self.log.last_index(),
             reply_to,
             reply_term,
@@ -1134,15 +1169,25 @@ impl Raft {
             Persist::VoteReply { to, term, granted } => {
                 self.send(io, to, RaftMsg::RequestVoteResp { term, granted });
             }
+            Persist::Reply { to, msg } => self.send(io, to, msg),
             Persist::LogDurable {
+                from,
                 index,
                 reply_to,
                 reply_term,
             } => {
                 let index = index.min(self.log.last_index());
+                // A completed sync only proves that the writes it covered
+                // reached the platter. Entries below `from` belong to earlier
+                // batches, and if one of those writes failed -- the disk can
+                // reject an operation, and the error arrives asynchronously --
+                // the file has a hole in it. Claiming the whole prefix here
+                // would report entries as durable that were never written, and
+                // a leader counting this node towards a quorum would commit
+                // them.
                 if index > self.durable_index {
-                    self.durable_index = index;
-                    io.observe("durable", &[index]);
+                    self.parked.push((from, index));
+                    self.advance_durable(io);
                 }
                 if let Some(to) = reply_to {
                     // Only claim what is durable *and* still ours: a truncation
@@ -1167,6 +1212,37 @@ impl Raft {
     }
 
     // ---- plumbing ---------------------------------------------------------
+
+    /// Extend the durable claim as far as the confirmed ranges reach.
+    ///
+    /// A range may only be claimed once everything below it is confirmed, so
+    /// one range landing can unblock several others.
+    fn advance_durable(&mut self, io: &mut dyn Io) {
+        loop {
+            let at = self.durable_index;
+            self.parked.retain(|(_, to)| *to > at);
+            let Some(pos) = self
+                .parked
+                .iter()
+                .position(|(from, to)| *from <= at + 1 && *to > at)
+            else {
+                break;
+            };
+            let (_, to) = self.parked.remove(pos);
+            self.durable_index = to;
+            io.observe("durable", &[to]);
+        }
+        if self.parked.len() > 4096 {
+            // The prefix is not closing, which means a write failed and this
+            // node is about to be told so. Stop hoarding either way.
+            io.trace(
+                Level::Warn,
+                "raft",
+                format!("{} durability claims stuck behind a gap", self.parked.len()),
+            );
+            self.parked.clear();
+        }
+    }
 
     fn send(&mut self, io: &mut dyn Io, to: NodeId, msg: RaftMsg) {
         let bytes = Message::Raft(msg).encode();
@@ -1307,6 +1383,7 @@ mod tests {
     fn truncation_clamps_in_flight_durability_claims() {
         let mut p = Persister::default();
         let b = p.start(Persist::LogDurable {
+            from: 5,
             index: 10,
             reply_to: None,
             reply_term: 0,
@@ -1318,6 +1395,7 @@ mod tests {
         assert_eq!(
             p.on_complete(2, true),
             BatchEvent::Done(Persist::LogDurable {
+                from: 5,
                 index: 6,
                 reply_to: None,
                 reply_term: 0

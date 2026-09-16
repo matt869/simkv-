@@ -45,10 +45,32 @@ pub struct NodeView<'a> {
 #[derive(Clone, Debug, Default)]
 struct NodeTrack {
     checked_upto: u64,
+    committed_checked: u64,
+    applied_checked: u64,
     truncations: u64,
     incarnation: u64,
     commit_index: u64,
     acted_term: u64,
+}
+
+/// A committed entry, with the evidence for when it was committed.
+#[derive(Clone, Debug)]
+pub struct CommittedRec {
+    pub term: u64,
+    pub cmd: Command,
+    /// The term of the first node observed reporting this index committed.
+    ///
+    /// Leader completeness only binds leaders of *later* terms: an entry
+    /// committed in term 5 must appear in every leader from term 6 onwards. A
+    /// node still calling itself leader of term 1 because it has been
+    /// partitioned away has no obligation to hold it, and reporting one would
+    /// be a false alarm on entirely correct behaviour.
+    ///
+    /// Recorded once and never lowered. Since the checker runs after every
+    /// event, the first reporter is the committing leader or one of its
+    /// followers; if it were ever later than the real committing term, the
+    /// effect is a weaker check, never a spurious failure.
+    pub committed_in_term: u64,
 }
 
 #[derive(Default)]
@@ -58,7 +80,11 @@ pub struct Invariants {
     /// (index, term) -> the command that (index, term) must always name.
     entries: BTreeMap<(u64, u64), Command>,
     /// index -> the entry every node must eventually agree on.
-    committed: BTreeMap<u64, (u64, Command)>,
+    committed: BTreeMap<u64, CommittedRec>,
+    /// (node, term) -> how far leader completeness has been verified for that
+    /// leadership, so the check stays incremental instead of rescanning every
+    /// committed entry on every event.
+    leader_verified: BTreeMap<(NodeId, u64), u64>,
     /// Highest index anyone has reported committed.
     max_committed: u64,
     /// index -> what was applied to a state machine there.
@@ -103,19 +129,35 @@ impl Invariants {
         let restarted = track.incarnation != v.incarnation;
         let truncated = track.truncations != v.truncations;
         track.incarnation = v.incarnation;
-        if truncated {
+        if truncated || restarted {
             track.truncations = v.truncations;
             // Entries at or after the truncation point may have been replaced,
-            // so everything has to be looked at again.
+            // and a restart may have lost an unsynced tail, so everything has
+            // to be looked at again.
             track.checked_upto = 0;
+            track.committed_checked = 0;
+            track.applied_checked = 0;
         }
         let acted_term = track.acted_term;
         let prev_commit = track.commit_index;
         let checked_upto = track.checked_upto;
+        let committed_from = track.committed_checked + 1;
+        let applied_from = track.applied_checked + 1;
 
         if !v.up {
             // A down node's volatile state is meaningless; its disk is checked
             // by the durability checker instead.
+            //
+            // Forget the volatile state it had, because a crash genuinely
+            // destroys it: commit index and applied index come back at zero,
+            // and the log may have lost its unsynced tail, so everything has to
+            // be looked at again once it returns. Remembering the pre-crash
+            // values here would report every single restart as state going
+            // backwards.
+            track.commit_index = 0;
+            track.checked_upto = 0;
+            track.committed_checked = 0;
+            track.applied_checked = 0;
             return;
         }
 
@@ -211,39 +253,51 @@ impl Invariants {
             *seen = (*seen).max(v.log.last_index());
 
             // --- leader completeness -----------------------------------
-            // A leader must hold every entry that was already committed when it
-            // was elected. Checking against everything known committed is
-            // stricter than needed only for entries committed in this instant,
-            // and those are its own.
-            for (index, (term, cmd)) in self.committed.range(..=self.max_committed) {
+            // An entry committed under a leader of term T must be present in
+            // every leader from term T+1 onwards. Entries committed in this
+            // node's own term or later are not its obligation: either it
+            // committed them itself, or a later leader did and this one is
+            // simply out of date and unable to commit anything anyway.
+            let verified = self.leader_verified.entry((v.id, v.term)).or_insert(0);
+            let from = *verified + 1;
+            let mut checked_to = *verified;
+            for (index, rec) in self.committed.range(from..) {
+                if rec.committed_in_term >= v.term {
+                    checked_to = *index;
+                    continue;
+                }
                 if *index > v.log.last_index() {
                     out.push(Violation::new(
                         "leader_completeness",
                         time,
                         Some(v.id),
                         format!(
-                            "leader of term {} is missing committed index {index} (log ends at {})",
+                            "leader of term {} is missing index {index}, committed in term {} \
+                             (log ends at {})",
                             v.term,
+                            rec.committed_in_term,
                             v.log.last_index()
                         ),
                     ));
                     break;
                 }
                 let entry = v.log.get(*index).expect("index is within the log");
-                if entry.term != *term || entry.cmd != *cmd {
+                if entry.term != rec.term || entry.cmd != rec.cmd {
                     out.push(Violation::new(
                         "leader_completeness",
                         time,
                         Some(v.id),
                         format!(
-                            "leader of term {} has a different entry at committed index {index}: \
-                             term {} vs {term}",
-                            v.term, entry.term
+                            "leader of term {} has a different entry at index {index}, \
+                             committed in term {}: term {} vs {}",
+                            v.term, rec.committed_in_term, entry.term, rec.term
                         ),
                     ));
                     break;
                 }
+                checked_to = *index;
             }
+            self.leader_verified.insert((v.id, v.term), checked_to);
         }
 
         // --- log matching ----------------------------------------------
@@ -272,33 +326,46 @@ impl Invariants {
         }
 
         // --- committed entries are immutable ---------------------------
-        for index in 1..=v.commit_index {
+        // Resumed from a watermark: a full rescan on every event would make
+        // checking cost more than simulating. The watermark is reset whenever
+        // the node truncates or restarts, which are the only ways an entry
+        // already looked at can change.
+        let mut committed_checked = committed_from.saturating_sub(1);
+        for index in committed_from..=v.commit_index {
             let Some(entry) = v.log.get(index) else {
                 break;
             };
             match self.committed.get(&index) {
-                Some((term, cmd)) if *term != entry.term || *cmd != entry.cmd => {
+                Some(rec) if rec.term != entry.term || rec.cmd != entry.cmd => {
                     out.push(Violation::new(
                         "committed_entry_changed",
                         time,
                         Some(v.id),
                         format!(
-                            "committed index {index} was term {term} {cmd:?}, now term {} {:?}",
-                            entry.term, entry.cmd
+                            "committed index {index} was term {} {:?}, now term {} {:?}",
+                            rec.term, rec.cmd, entry.term, entry.cmd
                         ),
                     ));
                 }
                 Some(_) => {}
                 None => {
-                    self.committed
-                        .insert(index, (entry.term, entry.cmd.clone()));
+                    self.committed.insert(
+                        index,
+                        CommittedRec {
+                            term: entry.term,
+                            cmd: entry.cmd.clone(),
+                            committed_in_term: v.term,
+                        },
+                    );
                     self.max_committed = self.max_committed.max(index);
                 }
             }
+            committed_checked = index;
         }
 
         // --- state machine safety --------------------------------------
-        for index in 1..=v.last_applied {
+        let mut applied_checked = applied_from.saturating_sub(1);
+        for index in applied_from..=v.last_applied {
             let Some(entry) = v.log.get(index) else {
                 break;
             };
@@ -320,10 +387,13 @@ impl Invariants {
                     self.applied.insert(index, (entry.term, entry.cmd.clone()));
                 }
             }
+            applied_checked = index;
         }
 
         let track = self.nodes.entry(v.id).or_default();
         track.checked_upto = newly_checked;
+        track.committed_checked = committed_checked;
+        track.applied_checked = applied_checked;
         track.commit_index = v.commit_index;
     }
 
@@ -333,7 +403,7 @@ impl Invariants {
     }
 
     /// The entry that must live at `index` on every node, once committed.
-    pub fn committed_entry(&self, index: u64) -> Option<&(u64, Command)> {
+    pub fn committed_entry(&self, index: u64) -> Option<&CommittedRec> {
         self.committed.get(&index)
     }
 }
@@ -496,6 +566,29 @@ mod tests {
         assert!(inv.observe(0, &[view(0, Role::Follower, 1, &log, 2)]).is_empty());
         let v = inv.observe(1, &[view(0, Role::Follower, 1, &log, 1)]);
         assert!(v.iter().any(|x| x.kind == "commit_regression"), "got {v:?}");
+    }
+
+    #[test]
+    fn a_node_seen_down_may_come_back_at_zero() {
+        // The common case: the checker observes the node while it is down, so
+        // the incarnation bump is consumed before it returns. Coming back with
+        // an empty commit index is a crash doing its job, not a regression.
+        let log = log_of(&[(1, 1, 0), (2, 1, 0)]);
+        let mut inv = Invariants::new();
+        assert!(inv.observe(0, &[view(0, Role::Follower, 1, &log, 2)]).is_empty());
+
+        let mut down = view(0, Role::Follower, 1, &log, 0);
+        down.up = false;
+        down.incarnation = 1;
+        assert!(inv.observe(1, &[down]).is_empty());
+
+        let mut back = view(0, Role::Follower, 1, &log, 0);
+        back.incarnation = 1;
+        let found = inv.observe(2, &[back]);
+        assert!(
+            found.iter().all(|x| x.kind != "commit_regression"),
+            "a restart is not a commit regression: {found:?}"
+        );
     }
 
     #[test]

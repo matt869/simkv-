@@ -45,6 +45,9 @@ pub struct SimConfig {
     pub max_events: u64,
     /// Events between invariant sweeps. 1 checks after every single event.
     pub check_every: u64,
+    /// Events between durability sweeps, which decode every node's disk and
+    /// are far more expensive than the in-memory invariants.
+    pub check_durability_every: u64,
     pub check_liveness: bool,
     pub linearizability_budget: u64,
     pub net: NetConfig,
@@ -67,6 +70,7 @@ impl Default for SimConfig {
             drain: 5 * SECONDS,
             max_events: 4_000_000,
             check_every: 1,
+            check_durability_every: 200,
             check_liveness: true,
             linearizability_budget: checker::linearizability::DEFAULT_BUDGET,
             net: NetConfig::hostile(),

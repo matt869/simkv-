@@ -42,6 +42,9 @@ COMMON OPTIONS:
     --benign            No faults at all: a perfect network and honest disks
     --no-liveness       Do not require progress after recovery
     --trace LEVEL       off | error | warn | info | debug (default off)
+    --check-durability-every N
+                        Events between disk-level durability sweeps (default 200;
+                        set to 1 to pinpoint exactly when a claim goes bad)
 
 SWEEP OPTIONS:
     --seeds N           How many seeds to run (default 200)
@@ -238,6 +241,9 @@ fn config(args: &Args) -> SimConfig {
     }
     if let Some(n) = args.opt_u64("max-events") {
         cfg.max_events = n;
+    }
+    if let Some(n) = args.opt_u64("check-durability-every") {
+        cfg.check_durability_every = n.max(1);
     }
     cfg.normalise();
     cfg
