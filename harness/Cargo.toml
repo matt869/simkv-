@@ -1,0 +1,17 @@
+[package]
+name = "harness"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "sim"
+path = "main.rs"
+
+[dependencies]
+simcore = { path = "../simcore" }
+sim-io = { path = "../sim-io" }
+kvstore = { path = "../kvstore" }
+checker = { path = "../checker" }

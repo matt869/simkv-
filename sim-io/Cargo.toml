@@ -1,0 +1,11 @@
+[package]
+name = "sim-io"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "sim_io"
+path = "lib.rs"
+
+[dependencies]
+simcore = { path = "../simcore" }

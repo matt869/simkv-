@@ -1,0 +1,11 @@
+[package]
+name = "checker"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+simcore = { path = "../simcore" }
+kvstore = { path = "../kvstore" }
