@@ -37,6 +37,69 @@ pub const LOG_REGION: usize = STATE_FILE_SIZE;
 pub const TIMER_ELECTION: TimerTag = 1;
 pub const TIMER_HEARTBEAT: TimerTag = 2;
 
+/// A deliberate defect, switched on to prove the checkers can see it.
+///
+/// A correctness harness that has never failed is indistinguishable from one
+/// that cannot fail. Each of these is a mistake a real implementation has
+/// actually shipped, and each must be caught by a sweep -- which the tests in
+/// `harness` assert.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum InjectedBug {
+    #[default]
+    None,
+    /// Acknowledge entries as soon as they are in memory, without waiting for
+    /// the `fsync`. The classic "we benchmarked it and it got faster".
+    AckBeforeSync,
+    /// Advance the commit index by counting replicas of an entry from any
+    /// term, not just the leader's own. Figure 8 of the Raft paper.
+    CommitAnyTerm,
+    /// Reveal a vote before it is durable, so a crash can forget it and let the
+    /// node vote a second time in the same term.
+    VoteBeforeSync,
+    /// Drop the client session cache, so a retried request applies twice.
+    NoDedup,
+    /// Truncate the log to whatever the leader sent, even when the leader is
+    /// sending a stale suffix.
+    TruncateOnAnyAppend,
+}
+
+impl InjectedBug {
+    pub const ALL: [InjectedBug; 5] = [
+        InjectedBug::AckBeforeSync,
+        InjectedBug::CommitAnyTerm,
+        InjectedBug::VoteBeforeSync,
+        InjectedBug::NoDedup,
+        InjectedBug::TruncateOnAnyAppend,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            InjectedBug::None => "none",
+            InjectedBug::AckBeforeSync => "ack-before-sync",
+            InjectedBug::CommitAnyTerm => "commit-any-term",
+            InjectedBug::VoteBeforeSync => "vote-before-sync",
+            InjectedBug::NoDedup => "no-dedup",
+            InjectedBug::TruncateOnAnyAppend => "truncate-on-any-append",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<InjectedBug> {
+        let all = [InjectedBug::None].into_iter().chain(InjectedBug::ALL);
+        all.into_iter().find(|b| b.name() == s)
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            InjectedBug::None => "no deliberate defect",
+            InjectedBug::AckBeforeSync => "acknowledges entries before they are durable",
+            InjectedBug::CommitAnyTerm => "commits by counting replicas of any term",
+            InjectedBug::VoteBeforeSync => "votes before the vote is durable",
+            InjectedBug::NoDedup => "applies retried client requests twice",
+            InjectedBug::TruncateOnAnyAppend => "truncates the log on any mismatch in length",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Follower,
@@ -63,6 +126,8 @@ pub struct RaftConfig {
     pub heartbeat_interval: Nanos,
     /// Maximum entries per AppendEntries.
     pub max_batch: usize,
+    /// A deliberate defect, for verifying that the checkers work.
+    pub bug: InjectedBug,
 }
 
 impl Default for RaftConfig {
@@ -71,6 +136,7 @@ impl Default for RaftConfig {
             election_timeout: (300 * MILLIS, 600 * MILLIS),
             heartbeat_interval: 50 * MILLIS,
             max_batch: 64,
+            bug: InjectedBug::None,
         }
     }
 }
@@ -256,6 +322,9 @@ struct Batch {
     writes_outstanding: usize,
     sync_issued: bool,
     action: Persist,
+    /// The term written to the hard-state slot in this batch, if any. Once the
+    /// batch syncs, that term is on stable storage.
+    hard_term: Option<u64>,
 }
 
 /// Sequences `write -> confirm -> fsync -> confirm` for a group of writes that
@@ -275,7 +344,10 @@ struct Persister {
 enum BatchEvent {
     Nothing,
     NeedSync(u64),
-    Done(Persist),
+    Done {
+        action: Persist,
+        hard_term: Option<u64>,
+    },
     Failed,
 }
 
@@ -287,6 +359,7 @@ impl Persister {
             writes_outstanding: 0,
             sync_issued: false,
             action,
+            hard_term: None,
         });
         self.next_id
     }
@@ -300,6 +373,13 @@ impl Persister {
             b.writes_outstanding += 1;
         }
         self.ops.insert(op, (id, OpKind::Write));
+    }
+
+    /// Record that this batch writes the hard state carrying `term`.
+    fn note_hard_state(&mut self, id: u64, term: u64) {
+        if let Some(b) = self.batch(id) {
+            b.hard_term = Some(term);
+        }
     }
 
     fn note_sync(&mut self, id: u64, op: OpId) {
@@ -333,7 +413,11 @@ impl Persister {
                 let Some(i) = self.batches.iter().position(|b| b.id == id) else {
                     return BatchEvent::Nothing;
                 };
-                BatchEvent::Done(self.batches.remove(i).action)
+                let b = self.batches.remove(i);
+                BatchEvent::Done {
+                    action: b.action,
+                    hard_term: b.hard_term,
+                }
             }
         }
     }
@@ -385,6 +469,12 @@ pub struct Raft {
     parked: Vec<(u64, u64)>,
     /// Sequence number for the next hard-state slot write.
     state_seq: u64,
+    /// Highest term known to be on stable storage.
+    ///
+    /// No message carrying a term above this may leave the node: announcing a
+    /// term that a crash could forget is how a node ends up acting twice in the
+    /// same term.
+    durable_term: u64,
 
     persister: Persister,
     election_timer: Deadline,
@@ -444,6 +534,7 @@ impl Raft {
             durable_index,
             parked: Vec::new(),
             state_seq: hs.seq + 1,
+            durable_term: hs.term,
             persister: Persister::default(),
             election_timer: Deadline::new(),
             heartbeat_timer: Deadline::new(),
@@ -610,7 +701,14 @@ impl Raft {
                 let sync_op = io.sync(FILE_WAL);
                 self.persister.note_sync(id, sync_op);
             }
-            BatchEvent::Done(action) => self.on_durable(io, action),
+            BatchEvent::Done { action, hard_term } => {
+                // The term reached stable storage with this sync, so messages
+                // carrying it may now be sent.
+                if let Some(t) = hard_term {
+                    self.durable_term = self.durable_term.max(t);
+                }
+                self.on_durable(io, action);
+            }
         }
     }
 
@@ -715,13 +813,26 @@ impl Raft {
             ),
         );
 
-        if dirty {
+        if dirty && self.cfg.bug != InjectedBug::VoteBeforeSync {
             let batch = self.persister.start(Persist::VoteReply {
                 to: from,
                 term: self.term,
                 granted,
             });
             self.write_hard_state(io, batch);
+        } else if dirty {
+            // The defect: the vote is written, but announced without waiting
+            // for it to reach the platter.
+            let batch = self.persister.start(Persist::Quiet);
+            self.write_hard_state(io, batch);
+            self.send(
+                io,
+                from,
+                RaftMsg::RequestVoteResp {
+                    term: self.term,
+                    granted,
+                },
+            );
         } else {
             self.send(
                 io,
@@ -904,6 +1015,16 @@ impl Raft {
         }
 
         let last_new_index = prev_index + entries.len() as u64;
+        if self.cfg.bug == InjectedBug::TruncateOnAnyAppend
+            && self.log.last_index() > last_new_index
+            && last_new_index >= prev_index
+        {
+            // The defect: trust the leader's length blindly, so a delayed or
+            // duplicated AppendEntries deletes entries that came after it.
+            self.stats.truncations += 1;
+            self.log.truncate_from(last_new_index + 1);
+            self.durable_index = self.durable_index.min(last_new_index);
+        }
         if let Some(i) = first_new {
             let start = prev_index + 1 + i as u64;
             if let Some(at) = conflict_at {
@@ -926,6 +1047,21 @@ impl Raft {
                 self.write_log_from(io, batch, start, conflict_at.is_some());
             } else {
                 self.persist_log_from(io, start, conflict_at.is_some(), Some(from), self.term);
+            }
+            if self.cfg.bug == InjectedBug::AckBeforeSync {
+                // The defect: answer now, claiming everything in memory is
+                // safe, instead of waiting for the sync to complete.
+                let last = self.log.last_index();
+                self.send(
+                    io,
+                    from,
+                    RaftMsg::AppendEntriesResp {
+                        term: self.term,
+                        success: true,
+                        match_index: last,
+                        conflict_index: NO_INDEX,
+                    },
+                );
             }
         } else if dirty {
             let batch = self.persister.start(Persist::LogDurable {
@@ -1055,7 +1191,9 @@ impl Raft {
         // Raft's commit rule: a leader may only commit by counting replicas of
         // an entry from its *own* term. Counting an older entry's replicas can
         // commit something a later leader will overwrite.
-        if candidate > self.commit_index && self.log.term_at(candidate) == Some(self.term) {
+        let own_term = self.log.term_at(candidate) == Some(self.term)
+            || self.cfg.bug == InjectedBug::CommitAnyTerm;
+        if candidate > self.commit_index && own_term {
             self.commit_index = candidate;
             io.observe("commit", &[self.commit_index]);
             io.trace(
@@ -1103,6 +1241,7 @@ impl Raft {
         let offset = HardState::slot_offset(hs.seq);
         self.state_seq += 1;
         let op = io.write_at(FILE_WAL, offset, &hs.to_slot());
+        self.persister.note_hard_state(batch, hs.term);
         self.persister.note_write(batch, op);
     }
 
@@ -1244,7 +1383,31 @@ impl Raft {
         }
     }
 
+    /// Send a message, unless it would announce a term that is not yet on
+    /// stable storage.
+    ///
+    /// Every reply that reveals durable state is already deferred behind its
+    /// sync, but a node also answers *stale* requests immediately -- "your term
+    /// is old, mine is T" -- and those answers were escaping during the window
+    /// where T was still in flight. A crash in that window brings the node back
+    /// below a term it has already spoken in, and a term it has forgotten is a
+    /// term it can vote in a second time.
+    ///
+    /// Dropping the message is safe: it is indistinguishable from the network
+    /// losing it, which it does constantly, and the sender retries.
     fn send(&mut self, io: &mut dyn Io, to: NodeId, msg: RaftMsg) {
+        if msg.term() > self.durable_term {
+            io.trace(
+                Level::Debug,
+                "raft",
+                format!(
+                    "withholding {msg:?} to {to}: term {} is not durable yet (durable {})",
+                    msg.term(),
+                    self.durable_term
+                ),
+            );
+            return;
+        }
         let bytes = Message::Raft(msg).encode();
         io.send(to, &bytes);
     }

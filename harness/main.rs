@@ -15,6 +15,7 @@ use harness::replay::{replay, write_trace};
 use harness::shrink::{describe, shrink};
 use harness::sweep::{default_threads, sweep, SweepConfig};
 use harness::{run, SimConfig};
+use kvstore::raft::InjectedBug;
 use simcore::trace::Level;
 use simcore::{MILLIS, SECONDS};
 use std::collections::BTreeMap;
@@ -41,6 +42,10 @@ COMMON OPTIONS:
     --settle MS         Quiet period after faults stop (default 15000)
     --benign            No faults at all: a perfect network and honest disks
     --no-liveness       Do not require progress after recovery
+    --quorum-loss       Let a majority go down at once; checks safety only
+    --bug NAME          Inject a deliberate defect, to prove the checkers see it:
+                        ack-before-sync, commit-any-term, vote-before-sync,
+                        no-dedup, truncate-on-any-append
     --trace LEVEL       off | error | warn | info | debug (default off)
     --check-durability-every N
                         Events between disk-level durability sweeps (default 200;
@@ -237,6 +242,22 @@ fn config(args: &Args) -> SimConfig {
         cfg.trace_level = l;
     }
     if args.has("no-liveness") {
+        cfg.check_liveness = false;
+    }
+    if let Some(name) = args.get("bug") {
+        match InjectedBug::parse(name) {
+            Some(b) => cfg.raft.bug = b,
+            None => {
+                let names: Vec<&str> = InjectedBug::ALL.iter().map(|b| b.name()).collect();
+                eprintln!("error: unknown --bug {name:?}; try one of: {}", names.join(", "));
+                std::process::exit(2);
+            }
+        }
+    }
+    if args.has("quorum-loss") {
+        // Let the injector take down a majority. Safety must still hold;
+        // progress plainly cannot, so the liveness check stands down.
+        cfg.faults.allow_quorum_loss = true;
         cfg.check_liveness = false;
     }
     if let Some(n) = args.opt_u64("max-events") {

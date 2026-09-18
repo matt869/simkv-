@@ -21,7 +21,7 @@
 
 use crate::codec::{Dec, DecodeError, Enc};
 use crate::log::{Command, Op};
-use crate::raft::{Raft, RaftConfig, RaftMsg, Role};
+use crate::raft::{InjectedBug, Raft, RaftConfig, RaftMsg, Role};
 use crate::Message;
 use sim_io::{Io, TimerTag};
 use simcore::disk::OpId;
@@ -167,11 +167,19 @@ struct Session {
 pub struct StateMachine {
     state: BTreeMap<String, String>,
     sessions: BTreeMap<u32, Session>,
+    bug: InjectedBug,
 }
 
 impl StateMachine {
     pub fn new() -> StateMachine {
         StateMachine::default()
+    }
+
+    pub fn with_bug(bug: InjectedBug) -> StateMachine {
+        StateMachine {
+            bug,
+            ..StateMachine::default()
+        }
     }
 
     pub fn state(&self) -> &BTreeMap<String, String> {
@@ -181,6 +189,9 @@ impl StateMachine {
     /// The remembered result for `(client, seq)`, if this exact request has
     /// already been applied.
     pub fn cached(&self, client: u32, seq: u64) -> Option<Outcome> {
+        if self.bug == InjectedBug::NoDedup {
+            return None;
+        }
         self.sessions
             .get(&client)
             .filter(|s| s.seq == seq)
@@ -194,7 +205,9 @@ impl StateMachine {
             return Outcome::Written;
         }
         if let Some(s) = self.sessions.get(&cmd.client) {
-            if s.seq >= cmd.seq {
+            // The defect: without this, a retry that reaches the log twice is
+            // applied twice, which turns one logical operation into two.
+            if s.seq >= cmd.seq && self.bug != InjectedBug::NoDedup {
                 // Already applied: a duplicate reached the log anyway (two
                 // leaders, or a retry that raced its own original).
                 return s.outcome.clone();
@@ -266,10 +279,10 @@ impl KvServer {
         seed: u64,
     ) -> KvServer {
         KvServer {
-            raft: Raft::recover(io, id, members, cfg, seed),
+            raft: Raft::recover(io, id, members, cfg.clone(), seed),
             // The state machine is volatile and rebuilt by replaying the log as
             // entries are committed, exactly as Raft intends.
-            sm: StateMachine::new(),
+            sm: StateMachine::with_bug(cfg.bug),
             waiting: BTreeMap::new(),
             stats: ServerStats::default(),
         }

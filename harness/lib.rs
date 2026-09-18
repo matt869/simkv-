@@ -21,7 +21,7 @@ pub use workload::WorkloadConfig;
 
 use checker::linearizability::{History, Verdict};
 use checker::Report;
-use kvstore::raft::RaftConfig;
+use kvstore::raft::{InjectedBug, RaftConfig};
 use simcore::disk::DiskConfig;
 use simcore::faults::FaultConfig;
 use simcore::net::NetConfig;
@@ -56,6 +56,14 @@ pub struct SimConfig {
     pub raft: RaftConfig,
     pub workload: WorkloadConfig,
     pub trace_level: Level,
+}
+
+impl SimConfig {
+    /// Switch on a deliberate defect, to check that the checkers can see it.
+    pub fn with_bug(mut self, bug: InjectedBug) -> SimConfig {
+        self.raft.bug = bug;
+        self
+    }
 }
 
 impl Default for SimConfig {
@@ -250,6 +258,49 @@ mod tests {
         let out = run(cfg);
         assert!(!out.failed(), "{}", out.detail());
         assert!(out.stats.ops_completed > 20);
+    }
+
+    /// Sweep a handful of seeds and report how the first failure looked.
+    fn find_failure(bug: InjectedBug, seeds: u64) -> Option<(u64, &'static str)> {
+        for seed in 1..=seeds {
+            let mut cfg = SimConfig::with_seed(seed).with_bug(bug);
+            cfg.duration = 6 * SECONDS;
+            cfg.settle = 10 * SECONDS;
+            cfg.drain = 3 * SECONDS;
+            cfg.normalise();
+            let out = run(cfg);
+            if out.failed() {
+                return Some((seed, out.signature()));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn every_injected_bug_is_caught() {
+        // The test that keeps the rest of the suite honest. A harness that has
+        // never failed is indistinguishable from one that cannot fail, so each
+        // deliberate defect has to be detected -- otherwise the oracles are
+        // decoration.
+        for bug in InjectedBug::ALL {
+            match find_failure(bug, 40) {
+                Some((seed, signature)) => {
+                    assert_ne!(signature, "ok");
+                    println!("{} caught at seed {seed} as [{signature}]", bug.name());
+                }
+                None => panic!(
+                    "the checkers did not notice a store that {} within 40 seeds",
+                    bug.describe()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn an_unmodified_store_survives_the_same_seeds() {
+        // The control: the seeds that expose the injected defects must not
+        // fail without them, or the test above proves nothing.
+        assert_eq!(find_failure(InjectedBug::None, 40), None);
     }
 
     #[test]
