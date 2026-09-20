@@ -126,21 +126,19 @@ pub fn sweep(cfg: SweepConfig) -> SweepResult {
 
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= cfg.count {
-                        return;
-                    }
-                    let mut run_cfg = cfg.base.clone();
-                    run_cfg.seed = cfg.start_seed + i;
-                    run_cfg.normalise();
-                    let outcome = run(run_cfg);
-                    record(&shared, &cfg, &stop, outcome);
+            scope.spawn(|| loop {
+                if stop.load(Ordering::Relaxed) {
+                    return;
                 }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= cfg.count {
+                    return;
+                }
+                let mut run_cfg = cfg.base.clone();
+                run_cfg.seed = cfg.start_seed + i;
+                run_cfg.normalise();
+                let outcome = run(run_cfg);
+                record(&shared, &cfg, &stop, outcome);
             });
         }
     });
@@ -151,12 +149,7 @@ pub fn sweep(cfg: SweepConfig) -> SweepResult {
     result
 }
 
-fn record(
-    shared: &Mutex<SweepResult>,
-    cfg: &SweepConfig,
-    stop: &AtomicBool,
-    outcome: RunOutcome,
-) {
+fn record(shared: &Mutex<SweepResult>, cfg: &SweepConfig, stop: &AtomicBool, outcome: RunOutcome) {
     let mut r = shared.lock().unwrap_or_else(|e| e.into_inner());
     r.runs += 1;
     r.ops_completed += outcome.stats.ops_completed;

@@ -132,28 +132,83 @@ the control.
 
 | Defect | Detection |
 |---|---|
-| `no-dedup` — retried requests apply twice | 284 of 300 seeds, as `linearizability` |
+| `no-dedup` — retried requests apply twice | 283 of 300, as `linearizability` |
 | `truncate-on-any-append` — trust the leader's length blindly | 300 of 300, as `commit_beyond_log` |
-| `ack-before-sync` — acknowledge before `fsync` | seed 37 of 40, as `leader_completeness` |
-| `vote-before-sync` — reveal a vote before it is durable | 5 of 300, as `durable_term_lost` |
-| `commit-any-term` — Raft Figure 8 | **not caught in 5000 seeds** |
+| `ack-before-sync` — acknowledge before `fsync` | 1 in 300, as `leader_completeness` |
+| `vote-before-sync` — reveal a vote before it is durable | 266 of 300 (was 5 of 300 before leader-biased faults) |
+| `commit-any-term` — Raft Figure 8 | not caught in 5000 seeds at the default batch size; **1 in 300 with `--max-batch 2`** |
 
-### The known gap
+### Closing the gap: aim the faults
 
-`commit-any-term` is a real defect that this harness does not reliably find, and
-it is listed as a gap rather than quietly dropped.
+`commit-any-term` escaped 5000 uniformly-random seeds. Two changes to the fault
+model were tried, and the result is a useful lesson about what a fault injector
+is actually for.
 
-The reason is that a new leader appends a no-op of its own term the moment it is
-elected, so the entry crossing the commit threshold is nearly always a
-current-term one regardless. The early commit does happen; it is almost always
-harmless. Turning it into lost data needs the leader to die inside the narrow
-window before its no-op replicates, and then a conflicting entry to win the next
-election.
+**Leader-biased crashes** (`leader_bias_ppm`, default 30%) aim crashes and
+isolations at whoever currently believes they are leading, rather than at a node
+picked uniformly. The interesting windows in a consensus protocol are all around
+a leadership change, and uniform faults reach them only by luck.
 
-Closing it would mean biasing the fault injector towards leadership churn —
-crashing leaders specifically, and doing it during that window — rather than
-crashing nodes uniformly at random. Uniform faults are good at finding common
-bugs and bad at finding rare interleavings, and this is the latter.
+This did not catch `commit-any-term` -- but it moved `vote-before-sync` from
+5 seeds in 300 to **266 in 300**, a fifty-fold improvement, because that defect
+also needs a crash inside a leadership window.
+
+It also made `ack-before-sync` *harder* to find, from roughly 1 in 40 to 1 in
+300: that defect is a lying **follower**, and crashing leaders more often means
+crashing followers less often. Aiming faults is a trade, not a free win. That is
+why the bias is a tunable rather than a rule, and why the detection test now
+sweeps 400 seeds in parallel instead of asserting against a threshold that sat
+just above the observed rate.
+
+**Small replication batches** (`--max-batch 2`) did catch it, at 1 seed in 300.
+The reason is precise: with a large batch the leader sends its new no-op
+*together* with the older entries, so a follower acknowledges both at once and
+the correct and the buggy commit rules agree. Only when entries arrive in small
+batches does a follower acknowledge at an old-term index -- which is exactly the
+situation Raft's commit rule exists for.
+
+The lesson is that the search was never the limiting factor. The defect was
+unreachable under the default configuration and trivially reachable one flag
+away; what needed widening was the space of *configurations*, not the number of
+seeds.
+
+---
+
+## Open: committed entries overwritten under small batches
+
+**Status: found, not fixed.** Reproduces at
+`sim run --seed 388 --max-batch 2 --duration 8000 --settle 12000 --drain 3000`
+(1 seed in 1000 at that configuration; the default `--max-batch 64` is clean
+over 2000 seeds).
+
+A committed entry is overwritten by one from an *earlier* term:
+
+```
+committed index 96 was term 8 Noop, now term 7 Put{k2, c2v22}
+committed index 96 (term 8) is on stable storage on 0 of 3 nodes
+```
+
+What the trace shows, and what it rules out:
+
+- No `durable_claim_unbacked` fires at any event, so every acknowledgement was
+  honestly backed by that node's disk at the moment it was sent.
+- No `durable_entry_lost` fires, so no restart discarded anything a node had
+  claimed was synced.
+- n0 holds the committed entries (`log=97 durable=97 term=9`, undamaged) and
+  correctly **refuses** to vote for n2: `granted=false (up_to_date=false)`.
+- n1 grants: `granted=true (up_to_date=true)` -- and n1's log is `last=(77,7)`
+  against n2's offered `last=(97,7)`. Same term, longer log. **Under Raft's
+  election restriction that vote is correct.**
+
+So the bad election is a symptom, not the cause. The real question is how n1
+came to be missing entries 78..97 that a quorum had committed: whether it
+truncated them while following a stale leader, or a leader counted an
+acknowledgement that a follower later walked back. `truncate()` guards against
+cutting below the commit index with a `debug_assert!`, which does not run in
+release builds, so that path is currently unobserved.
+
+Next step is to promote that assertion into a reported violation and re-run the
+seed, which will say directly whether a node is truncating committed entries.
 
 ---
 

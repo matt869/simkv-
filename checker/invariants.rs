@@ -482,8 +482,12 @@ mod tests {
     fn leaders_in_different_terms_are_fine() {
         let log = log_of(&[(1, 5, 0)]);
         let mut inv = Invariants::new();
-        assert!(inv.observe(0, &[view(0, Role::Leader, 5, &log, 0)]).is_empty());
-        assert!(inv.observe(1, &[view(1, Role::Leader, 6, &log, 0)]).is_empty());
+        assert!(inv
+            .observe(0, &[view(0, Role::Leader, 5, &log, 0)])
+            .is_empty());
+        assert!(inv
+            .observe(1, &[view(1, Role::Leader, 6, &log, 0)])
+            .is_empty());
     }
 
     #[test]
@@ -491,7 +495,9 @@ mod tests {
         let a = log_of(&[(1, 1, 0)]);
         let b = log_of(&[(1, 1, 9)]); // same index and term, different command
         let mut inv = Invariants::new();
-        assert!(inv.observe(0, &[view(0, Role::Follower, 1, &a, 0)]).is_empty());
+        assert!(inv
+            .observe(0, &[view(0, Role::Follower, 1, &a, 0)])
+            .is_empty());
         let v = inv.observe(1, &[view(1, Role::Follower, 1, &b, 0)]);
         assert_eq!(v[0].kind, "log_matching");
     }
@@ -501,7 +507,9 @@ mod tests {
         let a = log_of(&[(1, 1, 0), (2, 1, 0)]);
         let b = log_of(&[(1, 1, 0), (2, 2, 0)]); // index 2 replaced
         let mut inv = Invariants::new();
-        assert!(inv.observe(0, &[view(0, Role::Follower, 1, &a, 2)]).is_empty());
+        assert!(inv
+            .observe(0, &[view(0, Role::Follower, 1, &a, 2)])
+            .is_empty());
         let v = inv.observe(1, &[view(1, Role::Follower, 2, &b, 2)]);
         assert!(v.iter().any(|x| x.kind == "committed_entry_changed"));
     }
@@ -526,9 +534,14 @@ mod tests {
         let long = log_of(&[(1, 3, 0), (2, 3, 0), (3, 3, 0)]);
         let short = log_of(&[(1, 3, 0)]);
         let mut inv = Invariants::new();
-        assert!(inv.observe(0, &[view(0, Role::Leader, 3, &long, 0)]).is_empty());
+        assert!(inv
+            .observe(0, &[view(0, Role::Leader, 3, &long, 0)])
+            .is_empty());
         let v = inv.observe(1, &[view(0, Role::Leader, 3, &short, 0)]);
-        assert!(v.iter().any(|x| x.kind == "leader_append_only"), "got {v:?}");
+        assert!(
+            v.iter().any(|x| x.kind == "leader_append_only"),
+            "got {v:?}"
+        );
     }
 
     #[test]
@@ -542,7 +555,10 @@ mod tests {
         let mut vb = view(1, Role::Follower, 2, &b, 1);
         vb.last_applied = 1;
         let v = inv.observe(1, &[vb]);
-        assert!(v.iter().any(|x| x.kind == "state_machine_safety"), "got {v:?}");
+        assert!(
+            v.iter().any(|x| x.kind == "state_machine_safety"),
+            "got {v:?}"
+        );
     }
 
     #[test]
@@ -563,7 +579,9 @@ mod tests {
     fn commit_may_not_go_backwards_within_an_incarnation() {
         let log = log_of(&[(1, 1, 0), (2, 1, 0)]);
         let mut inv = Invariants::new();
-        assert!(inv.observe(0, &[view(0, Role::Follower, 1, &log, 2)]).is_empty());
+        assert!(inv
+            .observe(0, &[view(0, Role::Follower, 1, &log, 2)])
+            .is_empty());
         let v = inv.observe(1, &[view(0, Role::Follower, 1, &log, 1)]);
         assert!(v.iter().any(|x| x.kind == "commit_regression"), "got {v:?}");
     }
@@ -575,7 +593,9 @@ mod tests {
         // an empty commit index is a crash doing its job, not a regression.
         let log = log_of(&[(1, 1, 0), (2, 1, 0)]);
         let mut inv = Invariants::new();
-        assert!(inv.observe(0, &[view(0, Role::Follower, 1, &log, 2)]).is_empty());
+        assert!(inv
+            .observe(0, &[view(0, Role::Follower, 1, &log, 2)])
+            .is_empty());
 
         let mut down = view(0, Role::Follower, 1, &log, 0);
         down.up = false;
@@ -595,7 +615,9 @@ mod tests {
     fn restarting_resets_volatile_state_without_complaint() {
         let log = log_of(&[(1, 1, 0), (2, 1, 0)]);
         let mut inv = Invariants::new();
-        assert!(inv.observe(0, &[view(0, Role::Follower, 1, &log, 2)]).is_empty());
+        assert!(inv
+            .observe(0, &[view(0, Role::Follower, 1, &log, 2)])
+            .is_empty());
         let mut v2 = view(0, Role::Follower, 1, &log, 0);
         v2.incarnation = 1;
         assert!(inv.observe(1, &[v2]).is_empty());
@@ -619,14 +641,19 @@ mod tests {
     fn a_truncation_forces_a_recheck() {
         let a = log_of(&[(1, 1, 0), (2, 1, 0)]);
         let mut inv = Invariants::new();
-        assert!(inv.observe(0, &[view(0, Role::Follower, 1, &a, 0)]).is_empty());
+        assert!(inv
+            .observe(0, &[view(0, Role::Follower, 1, &a, 0)])
+            .is_empty());
         // The node truncates and replaces index 2 with a conflicting command
         // at the same term -- only a recheck can see it.
         let b = log_of(&[(1, 1, 0), (2, 1, 7)]);
         let mut v = view(0, Role::Follower, 1, &b, 0);
         v.truncations = 1;
         let found = inv.observe(1, &[v]);
-        assert!(found.iter().any(|x| x.kind == "log_matching"), "got {found:?}");
+        assert!(
+            found.iter().any(|x| x.kind == "log_matching"),
+            "got {found:?}"
+        );
     }
 
     #[test]

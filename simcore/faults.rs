@@ -68,6 +68,16 @@ pub struct FaultConfig {
     /// Maximum absolute clock offset handed to a node at startup.
     pub max_clock_skew: Nanos,
     pub max_clock_jump: Nanos,
+    /// How often a crash or isolation targets the *leader* rather than a node
+    /// picked uniformly at random.
+    ///
+    /// Uniform faults are good at finding common bugs and bad at finding rare
+    /// interleavings. The interesting windows in a consensus protocol are the
+    /// ones around a leadership change -- between an election and the new
+    /// leader replicating its first entry, say -- and a uniform injector
+    /// reaches them only by luck. Aiming at the leader walks the cluster
+    /// through those windows deliberately.
+    pub leader_bias_ppm: u32,
 }
 
 impl Default for FaultConfig {
@@ -91,6 +101,7 @@ impl Default for FaultConfig {
             window: (500 * crate::MILLIS, 20 * crate::SECONDS),
             max_clock_skew: 50 * crate::MILLIS,
             max_clock_jump: 500 * crate::MILLIS,
+            leader_bias_ppm: 300_000,
         }
     }
 }
@@ -153,6 +164,8 @@ pub struct FaultStats {
     pub heals: u64,
     pub clock_jumps: u64,
     pub slow_links: u64,
+    /// Faults aimed at the leader rather than a random node.
+    pub leader_targeted: u64,
 }
 
 pub struct FaultInjector {
@@ -208,7 +221,15 @@ impl FaultInjector {
     ///
     /// `None` means "do nothing this tick", which is itself important: a
     /// cluster that is never left alone never gets to demonstrate progress.
-    pub fn decide(&mut self, rng: &mut Rng, now: Nanos, up: &[bool]) -> Option<FaultAction> {
+    /// `leader` is whoever the cluster currently believes is in charge, if
+    /// anyone; it is used to aim faults rather than scatter them.
+    pub fn decide(
+        &mut self,
+        rng: &mut Rng,
+        now: Nanos,
+        up: &[bool],
+        leader: Option<NodeId>,
+    ) -> Option<FaultAction> {
         if now >= self.cfg.window.1 {
             if !self.recovered {
                 self.recovered = true;
@@ -258,7 +279,14 @@ impl FaultInjector {
         let action = match choice {
             FaultChoice::Crash => {
                 self.stats.crashes += 1;
-                FaultAction::Crash(*rng.choose(&alive)?)
+                let target = match leader {
+                    Some(l) if alive.contains(&l) && rng.chance_ppm(c.leader_bias_ppm) => {
+                        self.stats.leader_targeted += 1;
+                        l
+                    }
+                    _ => *rng.choose(&alive)?,
+                };
+                FaultAction::Crash(target)
             }
             FaultChoice::Restart => {
                 self.stats.restarts += 1;
@@ -276,7 +304,14 @@ impl FaultInjector {
             }
             FaultChoice::Isolate => {
                 self.stats.isolations += 1;
-                FaultAction::Isolate(NodeId(rng.below(n as u64) as u32))
+                let target = match leader {
+                    Some(l) if rng.chance_ppm(c.leader_bias_ppm) => {
+                        self.stats.leader_targeted += 1;
+                        l
+                    }
+                    _ => NodeId(rng.below(n as u64) as u32),
+                };
+                FaultAction::Isolate(target)
             }
             FaultChoice::Heal => {
                 self.stats.heals += 1;
@@ -352,7 +387,7 @@ mod tests {
         let mut inj = FaultInjector::new(FaultConfig::none());
         let mut rng = Rng::new(1);
         for t in 0..1000 {
-            assert_eq!(inj.decide(&mut rng, t, &[true; 3]), None);
+            assert_eq!(inj.decide(&mut rng, t, &[true; 3], None), None);
         }
     }
 
@@ -364,13 +399,16 @@ mod tests {
         };
         let mut inj = FaultInjector::new(cfg);
         let mut rng = Rng::new(1);
-        assert_eq!(inj.decide(&mut rng, 50, &[true; 5]), None);
+        assert_eq!(inj.decide(&mut rng, 50, &[true; 5], None), None);
         let during: Vec<_> = (100..200)
-            .filter_map(|t| inj.decide(&mut rng, t, &[true; 5]))
+            .filter_map(|t| inj.decide(&mut rng, t, &[true; 5], None))
             .collect();
         assert!(!during.is_empty(), "expected faults inside the window");
-        assert_eq!(inj.decide(&mut rng, 250, &[true; 5]), Some(FaultAction::Recover));
-        assert_eq!(inj.decide(&mut rng, 260, &[true; 5]), None);
+        assert_eq!(
+            inj.decide(&mut rng, 250, &[true; 5], None),
+            Some(FaultAction::Recover)
+        );
+        assert_eq!(inj.decide(&mut rng, 260, &[true; 5], None), None);
     }
 
     #[test]
@@ -379,7 +417,7 @@ mod tests {
         let mut rng = Rng::new(7);
         let mut up = [true; 5];
         for t in 0..20_000 {
-            match inj.decide(&mut rng, t, &up) {
+            match inj.decide(&mut rng, t, &up, None) {
                 Some(FaultAction::Crash(n)) => up[n.idx()] = false,
                 Some(FaultAction::Restart(n)) => up[n.idx()] = true,
                 _ => {}
@@ -400,7 +438,7 @@ mod tests {
         let mut up = [true; 3];
         let mut saw_majority_down = false;
         for t in 0..20_000 {
-            match inj.decide(&mut rng, t, &up) {
+            match inj.decide(&mut rng, t, &up, None) {
                 Some(FaultAction::Crash(n)) => up[n.idx()] = false,
                 Some(FaultAction::Restart(n)) => up[n.idx()] = true,
                 _ => {}
@@ -419,7 +457,7 @@ mod tests {
         let mut rng = Rng::new(3);
         let up = [true, false, true, true, false];
         for t in 0..5_000 {
-            match inj.decide(&mut rng, t, &up) {
+            match inj.decide(&mut rng, t, &up, None) {
                 Some(FaultAction::Crash(n)) => assert!(up[n.idx()]),
                 Some(FaultAction::Restart(n)) => assert!(!up[n.idx()]),
                 _ => {}
@@ -433,7 +471,8 @@ mod tests {
         let mut rng = Rng::new(5);
         let mut seen = 0;
         for t in 0..5_000 {
-            if let Some(FaultAction::Partition(groups)) = inj.decide(&mut rng, t, &[true; 5]) {
+            if let Some(FaultAction::Partition(groups)) = inj.decide(&mut rng, t, &[true; 5], None)
+            {
                 seen += 1;
                 assert_eq!(groups.len(), 2);
                 assert!(!groups[0].is_empty() && !groups[1].is_empty());
@@ -469,7 +508,7 @@ mod tests {
             let mut inj = FaultInjector::new(cfg_all_on());
             let mut rng = Rng::new(1234);
             (0..2000)
-                .filter_map(|t| inj.decide(&mut rng, t, &[true, true, false, true, true]))
+                .filter_map(|t| inj.decide(&mut rng, t, &[true, true, false, true, true], None))
                 .map(|a| format!("{a:?}"))
                 .collect::<Vec<_>>()
         };

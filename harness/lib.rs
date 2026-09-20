@@ -176,11 +176,9 @@ impl RunOutcome {
     /// that a smaller configuration reproduces the same bug rather than some
     /// other one it happened to stumble into.
     pub fn signature(&self) -> &'static str {
-        self.report.signature().unwrap_or(if self.incomplete {
-            "incomplete"
-        } else {
-            "ok"
-        })
+        self.report
+            .signature()
+            .unwrap_or(if self.incomplete { "incomplete" } else { "ok" })
     }
 
     pub fn summary(&self) -> String {
@@ -217,7 +215,9 @@ impl RunOutcome {
             s.push_str(&self.report.render());
         }
         if let Verdict::Unknown { key, reason } = &self.verdict {
-            s.push_str(&format!("\nlinearizability undecided for key {key}: {reason}\n"));
+            s.push_str(&format!(
+                "\nlinearizability undecided for key {key}: {reason}\n"
+            ));
         }
         s
     }
@@ -260,20 +260,27 @@ mod tests {
         assert!(out.stats.ops_completed > 20);
     }
 
-    /// Sweep a handful of seeds and report how the first failure looked.
+    /// Sweep seeds in parallel and report how the first failure looked.
+    ///
+    /// Parallel rather than a sequential loop because the budget has to be
+    /// realistic: the rarest of these defects shows up in roughly one run in
+    /// three hundred, and a threshold set just above the observed rate is a
+    /// flaky test waiting to happen.
     fn find_failure(bug: InjectedBug, seeds: u64) -> Option<(u64, &'static str)> {
-        for seed in 1..=seeds {
-            let mut cfg = SimConfig::with_seed(seed).with_bug(bug);
-            cfg.duration = 6 * SECONDS;
-            cfg.settle = 10 * SECONDS;
-            cfg.drain = 3 * SECONDS;
-            cfg.normalise();
-            let out = run(cfg);
-            if out.failed() {
-                return Some((seed, out.signature()));
-            }
-        }
-        None
+        let mut base = SimConfig::with_seed(1).with_bug(bug);
+        base.duration = 6 * SECONDS;
+        base.settle = 10 * SECONDS;
+        base.drain = 3 * SECONDS;
+        base.normalise();
+        let result = sweep::sweep(sweep::SweepConfig {
+            base,
+            start_seed: 1,
+            count: seeds,
+            threads: sweep::default_threads(),
+            stop_after: 1,
+            verbose: false,
+        });
+        result.failures.first().map(|f| (f.seed, f.signature))
     }
 
     #[test]
@@ -286,7 +293,7 @@ mod tests {
         // One defect is a known gap rather than a passing case, and it is
         // reported as such instead of being quietly dropped from the list.
         for bug in InjectedBug::ALL {
-            let found = find_failure(bug, 40);
+            let found = find_failure(bug, 400);
             match (found, bug.detection_gap()) {
                 (Some((seed, signature)), _) => {
                     assert_ne!(signature, "ok");
@@ -296,7 +303,7 @@ mod tests {
                     println!("{} NOT caught (known gap): {why}", bug.name());
                 }
                 (None, None) => panic!(
-                    "the checkers did not notice a store that {} within 40 seeds",
+                    "the checkers did not notice a store that {} within 400 seeds",
                     bug.describe()
                 ),
             }
@@ -307,13 +314,15 @@ mod tests {
     fn an_unmodified_store_survives_the_same_seeds() {
         // The control: the seeds that expose the injected defects must not
         // fail without them, or the test above proves nothing.
-        assert_eq!(find_failure(InjectedBug::None, 40), None);
+        assert_eq!(find_failure(InjectedBug::None, 400), None);
     }
 
     #[test]
     fn config_normalisation_keeps_the_window_inside_the_run() {
-        let mut cfg = SimConfig::default();
-        cfg.duration = 3 * SECONDS;
+        let mut cfg = SimConfig {
+            duration: 3 * SECONDS,
+            ..SimConfig::default()
+        };
         cfg.normalise();
         assert_eq!(cfg.faults.window.1, 3 * SECONDS);
         assert!(cfg.faults.window.0 <= cfg.faults.window.1);

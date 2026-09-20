@@ -67,7 +67,13 @@ impl Record {
             }
             None => s.push_str("  -  "),
         }
-        let _ = write!(s, " {} {:<9} {}", self.level.tag(), self.category, self.message);
+        let _ = write!(
+            s,
+            " {} {:<9} {}",
+            self.level.tag(),
+            self.category,
+            self.message
+        );
         s
     }
 }
@@ -183,7 +189,8 @@ impl Trace {
     pub fn observe(&mut self, time: Nanos, node: Option<NodeId>, tag: &'static str, args: &[u64]) {
         self.observed += 1;
         self.fingerprint.feed_u64(time);
-        self.fingerprint.feed_u64(node.map_or(u64::MAX, |n| n.0 as u64));
+        self.fingerprint
+            .feed_u64(node.map_or(u64::MAX, |n| n.0 as u64));
         self.fingerprint.feed_bytes(tag.as_bytes());
         for a in args {
             self.fingerprint.feed_u64(*a);

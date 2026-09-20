@@ -141,7 +141,10 @@ mod tests {
             quiet.fingerprint, loud.fingerprint,
             "tracing perturbed the simulation"
         );
-        assert!(!loud.trace.is_empty(), "debug replay should produce a trace");
+        assert!(
+            !loud.trace.is_empty(),
+            "debug replay should produce a trace"
+        );
         assert_eq!(quiet.stats.ops_completed, loud.outcome.stats.ops_completed);
     }
 

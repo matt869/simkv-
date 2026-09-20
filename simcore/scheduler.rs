@@ -161,6 +161,7 @@ impl Scheduler {
     }
 
     /// Pop the next live event, advancing virtual time to it.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<Fired> {
         while let Some(Reverse(entry)) = self.queue.pop() {
             if self.cancelled.remove(&entry.id) {

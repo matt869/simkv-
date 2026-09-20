@@ -164,7 +164,13 @@ impl World {
         self.trace.observe(now, node, tag, args);
     }
 
-    pub fn log(&mut self, level: Level, node: Option<NodeId>, cat: &'static str, msg: impl Into<String>) {
+    pub fn log(
+        &mut self,
+        level: Level,
+        node: Option<NodeId>,
+        cat: &'static str,
+        msg: impl Into<String>,
+    ) {
         let now = self.sched.now();
         self.trace.log(level, now, node, cat, msg);
     }
@@ -213,7 +219,13 @@ impl World {
         issued.op
     }
 
-    pub fn disk_write_at(&mut self, node: NodeId, file: FileId, offset: usize, bytes: &[u8]) -> OpId {
+    pub fn disk_write_at(
+        &mut self,
+        node: NodeId,
+        file: FileId,
+        offset: usize,
+        bytes: &[u8],
+    ) -> OpId {
         let issued = self.disks[node.idx()].write_at(&mut self.rng, file, offset, bytes);
         self.complete_storage(node, issued.op, issued.delay, issued.result);
         issued.op
@@ -232,8 +244,7 @@ impl World {
     }
 
     fn complete_storage(&mut self, node: NodeId, op: OpId, delay: Nanos, result: IoResult) {
-        self.sched
-            .after(delay, Event::Storage { node, op, result });
+        self.sched.after(delay, Event::Storage { node, op, result });
     }
 
     /// Read a file as the running node sees it. Used at startup for recovery.
@@ -385,7 +396,8 @@ mod tests {
                     w.disk_sync(to, 0);
                 }
                 if let Some(f) = w.sched.next() {
-                    w.trace.observe(f.time, f.event.target(), f.event.tag(), &[f.id]);
+                    w.trace
+                        .observe(f.time, f.event.target(), f.event.tag(), &[f.id]);
                 }
             }
             w.fingerprint()

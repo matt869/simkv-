@@ -225,13 +225,7 @@ impl Client {
         io.send(to, &msg.encode());
     }
 
-    pub fn on_bytes(
-        &mut self,
-        io: &mut dyn Io,
-        history: &mut History,
-        now: Nanos,
-        bytes: &[u8],
-    ) {
+    pub fn on_bytes(&mut self, io: &mut dyn Io, history: &mut History, now: Nanos, bytes: &[u8]) {
         let Ok(Message::Client(ClientMsg::Reply { req_id, outcome })) = Message::decode(bytes)
         else {
             // Corrupted, or something a client has no business receiving.
@@ -312,7 +306,10 @@ impl Client {
             io.trace(
                 Level::Info,
                 "client",
-                format!("c{} abandoning seq {} after {} attempts", self.id, f.seq, f.attempts),
+                format!(
+                    "c{} abandoning seq {} after {} attempts",
+                    self.id, f.seq, f.attempts
+                ),
             );
             self.inflight = None;
             self.think(io, history, now);
@@ -342,7 +339,10 @@ impl Client {
         // release builds, which would silently stop the history being recorded
         // at all -- and an empty history is trivially linearizable.
         let recorded = history.complete(id, now, outcome.clone());
-        debug_assert!(recorded, "reply for an operation the history never recorded");
+        debug_assert!(
+            recorded,
+            "reply for an operation the history never recorded"
+        );
         io.trace(
             Level::Debug,
             "client",

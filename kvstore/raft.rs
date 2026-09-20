@@ -96,7 +96,7 @@ impl InjectedBug {
     pub fn detection_gap(self) -> Option<&'static str> {
         match self {
             InjectedBug::CommitAnyTerm => Some(
-                "a new leader appends a no-op of its own term immediately, so the entry that                  crosses the commit threshold is nearly always a current-term one anyway. The                  early commit is real but almost always harmless, and turning it into lost data                  needs the leader to die in the window before its no-op replicates. Not observed                  in 5000 seeds.",
+                "a new leader appends a no-op of its own term immediately, so the entry crossing the commit threshold is nearly always a current-term one anyway. The early commit is real but almost always harmless; turning it into lost data needs the leader to die in the window before its no-op replicates. Not seen in 5000 seeds at the default batch size. It IS reachable with --max-batch 2, where followers acknowledge at an old-term index.",
             ),
             _ => None,
         }
@@ -203,7 +203,11 @@ impl RaftMsg {
                 last_index,
                 last_term,
             } => {
-                e.u8(1).u64(*term).u32(candidate.0).u64(*last_index).u64(*last_term);
+                e.u8(1)
+                    .u64(*term)
+                    .u32(candidate.0)
+                    .u64(*last_index)
+                    .u64(*last_term);
             }
             RaftMsg::RequestVoteResp { term, granted } => {
                 e.u8(2).u64(*term).u8(*granted as u8);
@@ -296,7 +300,11 @@ enum Persist {
     /// Hard state is durable: this node may now campaign for `term`.
     Campaign { term: u64 },
     /// Hard state is durable: the vote decision may now be revealed.
-    VoteReply { to: NodeId, term: u64, granted: bool },
+    VoteReply {
+        to: NodeId,
+        term: u64,
+        granted: bool,
+    },
     /// The log is durable through `index`.
     LogDurable {
         /// First index this batch actually wrote. Entries below it were
@@ -500,8 +508,17 @@ pub struct Raft {
 
 impl Raft {
     /// Start (or restart) a node, recovering whatever is on its disk.
-    pub fn recover(io: &mut dyn Io, id: NodeId, members: Vec<NodeId>, cfg: RaftConfig, seed: u64) -> Raft {
-        assert!(members.contains(&id), "a node must be a member of its cluster");
+    pub fn recover(
+        io: &mut dyn Io,
+        id: NodeId,
+        members: Vec<NodeId>,
+        cfg: RaftConfig,
+        seed: u64,
+    ) -> Raft {
+        assert!(
+            members.contains(&id),
+            "a node must be a member of its cluster"
+        );
         let bytes = io.read_all(FILE_WAL);
         let hs = recover_hard_state(&bytes);
         let log_bytes = if bytes.len() > LOG_REGION {
@@ -629,7 +646,11 @@ impl Raft {
     }
 
     fn peers(&self) -> Vec<NodeId> {
-        self.members.iter().copied().filter(|n| *n != self.id).collect()
+        self.members
+            .iter()
+            .copied()
+            .filter(|n| *n != self.id)
+            .collect()
     }
 
     // ---- event entry points ----------------------------------------------
@@ -645,7 +666,9 @@ impl Raft {
                 last_index,
                 last_term,
             } => self.on_request_vote(io, from, term, candidate, last_index, last_term),
-            RaftMsg::RequestVoteResp { term, granted } => self.on_vote_resp(io, from, term, granted),
+            RaftMsg::RequestVoteResp { term, granted } => {
+                self.on_vote_resp(io, from, term, granted)
+            }
             RaftMsg::AppendEntries {
                 term,
                 leader,
@@ -708,7 +731,11 @@ impl Raft {
             BatchEvent::Nothing => {}
             BatchEvent::Failed => {
                 self.failed = true;
-                io.trace(Level::Error, "raft", "storage failure; node is going down".into());
+                io.trace(
+                    Level::Error,
+                    "raft",
+                    "storage failure; node is going down".into(),
+                );
                 io.observe("io_failed", &[]);
             }
             BatchEvent::NeedSync(id) => {
@@ -719,7 +746,12 @@ impl Raft {
                 // The term reached stable storage with this sync, so messages
                 // carrying it may now be sent.
                 if let Some(t) = hard_term {
-                    self.durable_term = self.durable_term.max(t);
+                    if t > self.durable_term {
+                        self.durable_term = t;
+                        // Entries held back for want of a durable term may now
+                        // be claimable.
+                        self.advance_durable(io);
+                    }
                 }
                 self.on_durable(io, action);
             }
@@ -890,7 +922,11 @@ impl Raft {
         io.trace(
             Level::Info,
             "raft",
-            format!("elected leader for term {} with {} votes", self.term, self.votes.len()),
+            format!(
+                "elected leader for term {} with {} votes",
+                self.term,
+                self.votes.len()
+            ),
         );
 
         // A no-op from the new term. Without it, entries carried over from a
@@ -999,7 +1035,10 @@ impl Raft {
                 // old term having already acted in the new one -- which is how
                 // a node ends up casting a second vote in a term it already
                 // voted in.
-                let batch = self.persister.start(Persist::Reply { to: from, msg: reply });
+                let batch = self.persister.start(Persist::Reply {
+                    to: from,
+                    msg: reply,
+                });
                 self.write_hard_state(io, batch);
             } else {
                 self.send(io, from, reply);
@@ -1137,7 +1176,10 @@ impl Raft {
         io.trace(
             Level::Info,
             "raft",
-            format!("truncating log from index {at} (had {})", self.log.last_index()),
+            format!(
+                "truncating log from index {at} (had {})",
+                self.log.last_index()
+            ),
         );
         io.observe("truncate", &[at]);
         self.log.truncate_from(at);
@@ -1371,19 +1413,38 @@ impl Raft {
     /// A range may only be claimed once everything below it is confirmed, so
     /// one range landing can unblock several others.
     fn advance_durable(&mut self, io: &mut dyn Io) {
+        // An entry may only be called durable if the term that authorised it
+        // is durable too.
+        //
+        // Recovery discards entries whose term is ahead of the hard state,
+        // because such an entry could never have been acknowledged -- the sync
+        // that acknowledged it would have carried the term as well. That
+        // reasoning holds only while the hard-state write actually succeeds. If
+        // it fails, the disk rejects it asynchronously and later log writes
+        // sync happily on their own, so the node acknowledges entries at a term
+        // its disk has never heard of. They are committed on the strength of
+        // that acknowledgement, and then thrown away by its own recovery.
+        let cap = self.log.last_index_with_term_at_most(self.durable_term);
         loop {
             let at = self.durable_index;
             self.parked.retain(|(_, to)| *to > at);
             let Some(pos) = self
                 .parked
                 .iter()
-                .position(|(from, to)| *from <= at + 1 && *to > at)
+                .position(|(from, to)| *from <= at + 1 && *to > at && *from <= cap)
             else {
                 break;
             };
-            let (_, to) = self.parked.remove(pos);
-            self.durable_index = to;
-            io.observe("durable", &[to]);
+            let (_, to) = self.parked[pos];
+            let claim = to.min(cap);
+            if claim <= at {
+                break;
+            }
+            if claim == to {
+                self.parked.remove(pos);
+            }
+            self.durable_index = claim;
+            io.observe("durable", &[claim]);
         }
         if self.parked.len() > 4096 {
             // The prefix is not closing, which means a write failed and this

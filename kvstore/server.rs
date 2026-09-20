@@ -47,10 +47,7 @@ pub enum Outcome {
 impl Outcome {
     /// Whether this answers the question. Anything else means "retry".
     pub fn is_definite(&self) -> bool {
-        matches!(
-            self,
-            Outcome::Value(_) | Outcome::Written | Outcome::Cas(_)
-        )
+        matches!(self, Outcome::Value(_) | Outcome::Written | Outcome::Cas(_))
     }
 
     fn encode_into(&self, e: &mut Enc) {
@@ -322,7 +319,11 @@ impl KvServer {
             }
             Err(e) => {
                 self.stats.bad_messages += 1;
-                io.trace(Level::Warn, "wire", format!("dropping bad message from {from}: {e}"));
+                io.trace(
+                    Level::Warn,
+                    "wire",
+                    format!("dropping bad message from {from}: {e}"),
+                );
             }
         }
     }
@@ -354,7 +355,12 @@ impl KvServer {
         self.stats.requests += 1;
         if !self.raft.is_leader() {
             self.stats.redirected += 1;
-            self.reply(io, from, req_id, Outcome::NotLeader(self.raft.leader_hint()));
+            self.reply(
+                io,
+                from,
+                req_id,
+                Outcome::NotLeader(self.raft.leader_hint()),
+            );
             return;
         }
         // A retry whose original already committed is answered from the session
@@ -393,7 +399,12 @@ impl KvServer {
             }
             None => {
                 self.stats.redirected += 1;
-                self.reply(io, from, req_id, Outcome::NotLeader(self.raft.leader_hint()));
+                self.reply(
+                    io,
+                    from,
+                    req_id,
+                    Outcome::NotLeader(self.raft.leader_hint()),
+                );
             }
         }
         self.drain(io);
@@ -421,11 +432,7 @@ impl KvServer {
         // Anything still waiting on an index at or below the applied point can
         // never be answered by this node.
         let applied = self.raft.last_applied();
-        let stale: Vec<u64> = self
-            .waiting
-            .range(..=applied)
-            .map(|(i, _)| *i)
-            .collect();
+        let stale: Vec<u64> = self.waiting.range(..=applied).map(|(i, _)| *i).collect();
         for i in stale {
             if let Some(w) = self.waiting.remove(&i) {
                 self.stats.dropped += 1;

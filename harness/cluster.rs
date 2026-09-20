@@ -138,10 +138,10 @@ impl Cluster {
             }
             self.dispatch(fired);
             self.reap_failed();
-            if self.events % self.cfg.check_every == 0 {
+            if self.events.is_multiple_of(self.cfg.check_every) {
                 self.check_invariants();
             }
-            if self.events % self.cfg.check_durability_every == 0 {
+            if self.events.is_multiple_of(self.cfg.check_durability_every) {
                 self.check_durable_claims();
             }
         }
@@ -166,7 +166,13 @@ impl Cluster {
                 arg: 0,
             },
         );
-        self.world.sched.at(stop, Event::App { tag: APP_STOP, arg: 0 });
+        self.world.sched.at(
+            stop,
+            Event::App {
+                tag: APP_STOP,
+                arg: 0,
+            },
+        );
 
         // Stagger the clients so they do not all hit the same node at t=0.
         for i in 0..self.clients.len() {
@@ -247,7 +253,12 @@ impl Cluster {
         match tag {
             APP_FAULT_TICK => {
                 let up: Vec<bool> = self.world.up_flags()[..self.cfg.servers].to_vec();
-                if let Some(action) = self.world.faults.decide(&mut self.world.rng, now, &up) {
+                let leader = self.current_leader();
+                if let Some(action) =
+                    self.world
+                        .faults
+                        .decide(&mut self.world.rng, now, &up, leader)
+                {
                     self.apply_fault(action, now);
                 }
                 // Keep ticking until the injector has emitted its recovery.
@@ -299,7 +310,8 @@ impl Cluster {
                 self.world.net.heal_all();
                 self.world.net.partition(&groups);
                 self.stats.partitions += 1;
-                self.world.observe(None, "partition", &[groups.len() as u64]);
+                self.world
+                    .observe(None, "partition", &[groups.len() as u64]);
                 self.schedule_heal();
             }
             FaultAction::Isolate(node) => {
@@ -336,9 +348,13 @@ impl Cluster {
 
     fn schedule_heal(&mut self) {
         let d = self.world.faults.partition_duration(&mut self.world.rng);
-        self.world
-            .sched
-            .after(d, Event::App { tag: APP_HEAL, arg: 0 });
+        self.world.sched.after(
+            d,
+            Event::App {
+                tag: APP_HEAL,
+                arg: 0,
+            },
+        );
     }
 
     fn crash(&mut self, node: NodeId) {
@@ -375,8 +391,9 @@ impl Cluster {
         // Everything this node had synced must have come back unchanged.
         if let Some((before, durable)) = self.pre_crash_log.get(&node) {
             let after = server.raft.log().entries();
-            self.report
-                .extend(durability::check_recovery(now, node, before, *durable, after));
+            self.report.extend(durability::check_recovery(
+                now, node, before, *durable, after,
+            ));
         }
         // And the disk must not have forgotten a term this node acted on.
         if let Some(acted) = self.acted_term.get(&node).copied() {
@@ -410,6 +427,28 @@ impl Cluster {
                 );
             }
         }
+    }
+
+    /// Whoever currently believes they are leading, at the highest term seen.
+    ///
+    /// A best-effort view for aiming faults, not an oracle: during an election
+    /// there may be nobody, and a partitioned-away old leader still counts
+    /// itself as one. Both are fine -- hitting a stale leader is a useful fault
+    /// too.
+    fn current_leader(&self) -> Option<NodeId> {
+        let mut best: Option<(u64, NodeId)> = None;
+        for i in 0..self.cfg.servers {
+            let id = NodeId(i as u32);
+            if !self.world.is_up(id) {
+                continue;
+            }
+            if let Some(s) = &self.servers[i] {
+                if s.raft.is_leader() && best.is_none_or(|(t, _)| s.raft.term() > t) {
+                    best = Some((s.raft.term(), id));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     fn is_client(&self, node: NodeId) -> bool {
@@ -494,16 +533,18 @@ impl Cluster {
         }
 
         // Replicas that have applied the same number of entries must agree.
-        let states: Vec<(NodeId, u64, &std::collections::BTreeMap<String, String>)> = (0..self
-            .cfg
-            .servers)
-            .filter_map(|i| {
-                let id = NodeId(i as u32);
-                let s = self.servers[i].as_ref()?;
-                self.world.is_up(id).then(|| (id, s.raft.last_applied(), s.state()))
-            })
-            .collect();
-        self.report.extend(durability::check_convergence(now, &states));
+        let states: Vec<(NodeId, u64, &std::collections::BTreeMap<String, String>)> =
+            (0..self.cfg.servers)
+                .filter_map(|i| {
+                    let id = NodeId(i as u32);
+                    let s = self.servers[i].as_ref()?;
+                    self.world
+                        .is_up(id)
+                        .then(|| (id, s.raft.last_applied(), s.state()))
+                })
+                .collect();
+        self.report
+            .extend(durability::check_convergence(now, &states));
 
         // Everything committed must be on stable storage on a majority.
         let committed: Vec<CommittedEntry> = (1..=self.invariants.max_committed())

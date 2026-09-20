@@ -43,6 +43,9 @@ COMMON OPTIONS:
     --benign            No faults at all: a perfect network and honest disks
     --no-liveness       Do not require progress after recovery
     --quorum-loss       Let a majority go down at once; checks safety only
+    --max-batch N       Entries per AppendEntries (default 64). Small batches let
+                        followers acknowledge at an old-term index, which is where
+                        Raft's commit rule actually matters
     --bug NAME          Inject a deliberate defect, to prove the checkers see it:
                         ack-before-sync, commit-any-term, vote-before-sync,
                         no-dedup, truncate-on-any-append
@@ -249,7 +252,10 @@ fn config(args: &Args) -> SimConfig {
             Some(b) => cfg.raft.bug = b,
             None => {
                 let names: Vec<&str> = InjectedBug::ALL.iter().map(|b| b.name()).collect();
-                eprintln!("error: unknown --bug {name:?}; try one of: {}", names.join(", "));
+                eprintln!(
+                    "error: unknown --bug {name:?}; try one of: {}",
+                    names.join(", ")
+                );
                 std::process::exit(2);
             }
         }
@@ -262,6 +268,9 @@ fn config(args: &Args) -> SimConfig {
     }
     if let Some(n) = args.opt_u64("max-events") {
         cfg.max_events = n;
+    }
+    if let Some(n) = args.opt_u64("max-batch") {
+        cfg.raft.max_batch = (n as usize).max(1);
     }
     if let Some(n) = args.opt_u64("check-durability-every") {
         cfg.check_durability_every = n.max(1);
@@ -292,9 +301,7 @@ impl Args {
                 continue;
             }
             // A flag is a boolean unless the next token is a value.
-            let takes_value = argv
-                .get(i + 1)
-                .is_some_and(|next| !next.starts_with("--"));
+            let takes_value = argv.get(i + 1).is_some_and(|next| !next.starts_with("--"));
             if takes_value {
                 flags.insert(name.to_string(), argv[i + 1].clone());
                 i += 2;

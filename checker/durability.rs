@@ -92,7 +92,10 @@ pub fn check_committed_durable(
         // below.
         let holders = recovered
             .iter()
-            .filter(|(_, r)| r.get(c.index).is_some_and(|e| e.term == c.term && e.cmd == c.cmd))
+            .filter(|(_, r)| {
+                r.get(c.index)
+                    .is_some_and(|e| e.term == c.term && e.cmd == c.cmd)
+            })
             .count();
         if holders < quorum {
             out.push(Violation::new(
@@ -147,15 +150,15 @@ pub fn check_recovery(
         ));
         return out;
     }
-    for i in 0..promised as usize {
-        if after[i] != before[i] {
+    for (was, now) in before.iter().zip(after).take(promised as usize) {
+        if now != was {
             out.push(Violation::new(
                 "durable_entry_changed",
                 time,
                 Some(node),
                 format!(
                     "index {} was synced as term {} {:?} but recovered as term {} {:?}",
-                    before[i].index, before[i].term, before[i].cmd, after[i].term, after[i].cmd
+                    was.index, was.term, was.cmd, now.term, now.cmd
                 ),
             ));
             break;
@@ -197,9 +200,8 @@ pub fn check_durable_claim(
             ),
         )];
     }
-    for i in 0..(durable_index as usize).min(log.len()) {
-        let on_disk = &r.entries[i];
-        if *on_disk != log[i] {
+    for (in_memory, on_disk) in log.iter().zip(&r.entries).take(durable_index as usize) {
+        if on_disk != in_memory {
             return vec![Violation::new(
                 "durable_claim_unbacked",
                 time,
@@ -207,7 +209,7 @@ pub fn check_durable_claim(
                 format!(
                     "index {} is term {} {:?} in memory but term {} {:?} on disk, \
                      inside the range claimed durable ({durable_index})",
-                    log[i].index, log[i].term, log[i].cmd, on_disk.term, on_disk.cmd
+                    in_memory.index, in_memory.term, in_memory.cmd, on_disk.term, on_disk.cmd
                 ),
             )];
         }
@@ -418,7 +420,14 @@ mod tests {
     #[test]
     fn changing_a_synced_entry_is_caught() {
         let before = vec![entry(1, 1), entry(2, 1)];
-        let after = vec![entry(1, 1), Entry { term: 5, index: 2, cmd: cmd(2) }];
+        let after = vec![
+            entry(1, 1),
+            Entry {
+                term: 5,
+                index: 2,
+                cmd: cmd(2),
+            },
+        ];
         let v = check_recovery(0, NodeId(0), &before, 2, &after);
         assert_eq!(v[0].kind, "durable_entry_changed");
     }

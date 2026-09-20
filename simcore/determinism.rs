@@ -85,8 +85,16 @@ pub fn divergence_report(a: &[Record], b: &[Record], context: usize) -> String {
             let start = i.saturating_sub(context);
             let _ = writeln!(out, "first divergence at record {i}:");
             for j in start..=i {
-                let _ = writeln!(out, "  A[{j}] {}", a.get(j).map_or("<end>".into(), |r| r.render()));
-                let _ = writeln!(out, "  B[{j}] {}", b.get(j).map_or("<end>".into(), |r| r.render()));
+                let _ = writeln!(
+                    out,
+                    "  A[{j}] {}",
+                    a.get(j).map_or("<end>".into(), |r| r.render())
+                );
+                let _ = writeln!(
+                    out,
+                    "  B[{j}] {}",
+                    b.get(j).map_or("<end>".into(), |r| r.render())
+                );
             }
         }
     }

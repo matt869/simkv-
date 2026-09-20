@@ -123,17 +123,16 @@ pub fn describe(cfg: &SimConfig) -> String {
     )
 }
 
+type Simplify = Box<dyn Fn(&SimConfig) -> Option<SimConfig>>;
+
 /// One proposed simplification.
 struct Candidate {
     label: &'static str,
-    apply: Box<dyn Fn(&SimConfig) -> Option<SimConfig>>,
+    apply: Simplify,
 }
 
 fn candidates() -> Vec<Candidate> {
-    fn c(
-        label: &'static str,
-        f: impl Fn(&SimConfig) -> Option<SimConfig> + 'static,
-    ) -> Candidate {
+    fn c(label: &'static str, f: impl Fn(&SimConfig) -> Option<SimConfig> + 'static) -> Candidate {
         Candidate {
             label,
             apply: Box::new(f),
@@ -356,7 +355,7 @@ pub fn shrink(cfg: SimConfig, budget: usize, mut log: impl FnMut(&str)) -> Optio
 /// Shorten a duration to the nearest multiple of 100ms, for tidier reports.
 pub fn round_duration(d: Nanos) -> Nanos {
     let unit = 100 * MILLIS;
-    ((d + unit - 1) / unit) * unit
+    d.div_ceil(unit) * unit
 }
 
 #[cfg(test)]
@@ -391,12 +390,14 @@ mod tests {
     fn candidates_are_idempotent_at_their_floor() {
         // Applying a candidate to a config it has already been applied to must
         // eventually return None, or shrinking would not terminate.
-        let mut cfg = SimConfig::default();
-        cfg.servers = 1;
-        cfg.clients = 1;
+        let mut cfg = SimConfig {
+            servers: 1,
+            clients: 1,
+            duration: 500 * MILLIS,
+            settle: 5 * simcore::SECONDS,
+            ..SimConfig::default()
+        };
         cfg.workload.keys = 1;
-        cfg.duration = 500 * MILLIS;
-        cfg.settle = 5 * simcore::SECONDS;
         cfg.faults = simcore::faults::FaultConfig::none();
         cfg.net = simcore::net::NetConfig::reliable();
         cfg.disk = simcore::disk::DiskConfig::reliable();
@@ -419,7 +420,10 @@ mod tests {
         assert!(d.contains("crashes"));
         assert!(d.contains("partitions"));
         assert!(d.contains("torn="));
-        assert!(d.contains("cas:"), "the op mix belongs in a repro description");
+        assert!(
+            d.contains("cas:"),
+            "the op mix belongs in a repro description"
+        );
     }
 
     #[test]

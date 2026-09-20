@@ -264,7 +264,10 @@ impl Disk {
 
     /// Read the whole file as the running node sees it (page cache view).
     pub fn read_all(&self, file: FileId) -> Vec<u8> {
-        self.files.get(&file).map(|f| f.cache.clone()).unwrap_or_default()
+        self.files
+            .get(&file)
+            .map(|f| f.cache.clone())
+            .unwrap_or_default()
     }
 
     pub fn len(&self, file: FileId) -> usize {

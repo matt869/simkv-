@@ -251,7 +251,9 @@ mod tests {
         let fired = sched.next().expect("a delivery should be scheduled");
         assert!(fired.time > 0, "delivery should not be instantaneous");
         match fired.event {
-            Event::Deliver { from, to, payload, .. } => {
+            Event::Deliver {
+                from, to, payload, ..
+            } => {
                 assert_eq!((from.0, to.0), (0, 1));
                 assert_eq!(payload, b"hi");
             }

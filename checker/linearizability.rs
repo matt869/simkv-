@@ -440,7 +440,14 @@ fn describe(key: &str, ops: &[&Operation], stuck: usize) -> String {
 mod tests {
     use super::*;
 
-    fn op(id: u64, client: u32, invoked: Nanos, completed: Nanos, o: Op, out: Outcome) -> Operation {
+    fn op(
+        id: u64,
+        client: u32,
+        invoked: Nanos,
+        completed: Nanos,
+        o: Op,
+        out: Outcome,
+    ) -> Operation {
         Operation {
             id,
             client,

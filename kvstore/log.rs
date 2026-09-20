@@ -44,9 +44,16 @@ const MAX_RECORD: usize = 1 << 20;
 pub enum Op {
     /// Committed by a new leader to carry its term over the commit threshold.
     Noop,
-    Get { key: String },
-    Put { key: String, value: String },
-    Delete { key: String },
+    Get {
+        key: String,
+    },
+    Put {
+        key: String,
+        value: String,
+    },
+    Delete {
+        key: String,
+    },
     /// Compare-and-set: the operation that makes lost updates visible.
     Cas {
         key: String,
@@ -300,6 +307,13 @@ impl RaftLog {
         cand_last_term > my_term || (cand_last_term == my_term && cand_last_index >= my_index)
     }
 
+    /// Highest index whose entry was created in term `term` or earlier.
+    ///
+    /// Terms along a log never decrease, so this is a partition point.
+    pub fn last_index_with_term_at_most(&self, term: u64) -> u64 {
+        self.entries.partition_point(|e| e.term <= term) as u64
+    }
+
     /// Total bytes this log occupies on disk, for keeping the file length and
     /// the in-memory log in step.
     pub fn byte_len(&self) -> usize {
@@ -536,7 +550,10 @@ mod tests {
         // The classic lost-write shape: record 3 vanished, record 4 landed.
         let entries: Vec<Entry> = (1..=4).map(|i| entry(i, 1, "k")).collect();
         let mut bytes = log_bytes(&entries);
-        let start = entries[..2].iter().map(|e| e.to_record().len()).sum::<usize>();
+        let start = entries[..2]
+            .iter()
+            .map(|e| e.to_record().len())
+            .sum::<usize>();
         let len = entries[2].to_record().len();
         for b in &mut bytes[start..start + len] {
             *b = 0;
@@ -586,7 +603,10 @@ mod tests {
         let mut log = RaftLog::new();
         assert_eq!(log.last_index(), NO_INDEX);
         assert_eq!(log.term_at(NO_INDEX), Some(0));
-        assert!(log.matches(NO_INDEX, 0), "the empty position always matches");
+        assert!(
+            log.matches(NO_INDEX, 0),
+            "the empty position always matches"
+        );
         for i in 1..=5 {
             log.append(entry(i, 2, "k"));
         }
