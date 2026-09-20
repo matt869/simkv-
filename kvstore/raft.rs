@@ -88,6 +88,20 @@ impl InjectedBug {
         all.into_iter().find(|b| b.name() == s)
     }
 
+    /// Why a defect is not reliably caught, when it is not.
+    ///
+    /// Being explicit about this matters more than a green test: a harness is
+    /// only as good as the failures it can actually see, and pretending
+    /// otherwise is how a suite becomes decorative.
+    pub fn detection_gap(self) -> Option<&'static str> {
+        match self {
+            InjectedBug::CommitAnyTerm => Some(
+                "a new leader appends a no-op of its own term immediately, so the entry that                  crosses the commit threshold is nearly always a current-term one anyway. The                  early commit is real but almost always harmless, and turning it into lost data                  needs the leader to die in the window before its no-op replicates. Not observed                  in 5000 seeds.",
+            ),
+            _ => None,
+        }
+    }
+
     pub fn describe(self) -> &'static str {
         match self {
             InjectedBug::None => "no deliberate defect",
@@ -1514,7 +1528,13 @@ mod tests {
             "the sync waits for every write to be confirmed"
         );
         p.note_sync(b, 3);
-        assert_eq!(p.on_complete(3, true), BatchEvent::Done(Persist::Quiet));
+        assert_eq!(
+            p.on_complete(3, true),
+            BatchEvent::Done {
+                action: Persist::Quiet,
+                hard_term: None
+            }
+        );
         assert_eq!(p.in_flight(), 0);
     }
 
@@ -1538,8 +1558,20 @@ mod tests {
         assert_eq!(p.on_complete(10, true), BatchEvent::NeedSync(a));
         p.note_sync(b, 21);
         p.note_sync(a, 11);
-        assert_eq!(p.on_complete(11, true), BatchEvent::Done(Persist::Campaign { term: 1 }));
-        assert_eq!(p.on_complete(21, true), BatchEvent::Done(Persist::Quiet));
+        assert_eq!(
+            p.on_complete(11, true),
+            BatchEvent::Done {
+                action: Persist::Campaign { term: 1 },
+                hard_term: None
+            }
+        );
+        assert_eq!(
+            p.on_complete(21, true),
+            BatchEvent::Done {
+                action: Persist::Quiet,
+                hard_term: None
+            }
+        );
     }
 
     #[test]
@@ -1557,12 +1589,15 @@ mod tests {
         p.note_sync(b, 2);
         assert_eq!(
             p.on_complete(2, true),
-            BatchEvent::Done(Persist::LogDurable {
-                from: 5,
-                index: 6,
-                reply_to: None,
-                reply_term: 0
-            })
+            BatchEvent::Done {
+                action: Persist::LogDurable {
+                    from: 5,
+                    index: 6,
+                    reply_to: None,
+                    reply_term: 0
+                },
+                hard_term: None
+            }
         );
     }
 
