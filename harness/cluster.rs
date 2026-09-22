@@ -56,6 +56,8 @@ pub struct Cluster {
     acted_term: BTreeMap<NodeId, u64>,
     /// Stand-in log for a node that is currently down.
     empty_log: RaftLog,
+    /// Per-node count of committed-entry truncations already reported.
+    truncated_committed_seen: Vec<u64>,
 
     events: u64,
     incomplete: bool,
@@ -103,6 +105,7 @@ impl Cluster {
             })
             .collect();
 
+        let truncated_committed_seen = vec![0; servers.len()];
         Cluster {
             world,
             servers,
@@ -115,6 +118,7 @@ impl Cluster {
             pre_crash_log: BTreeMap::new(),
             acted_term: BTreeMap::new(),
             empty_log: RaftLog::new(),
+            truncated_committed_seen,
             events: 0,
             incomplete: false,
             finished: false,
@@ -484,6 +488,22 @@ impl Cluster {
 
     fn check_invariants(&mut self) {
         let now = self.world.now();
+        for i in 0..self.cfg.servers {
+            let Some(s) = &self.servers[i] else { continue };
+            let n = s.raft.stats().truncated_committed;
+            if n > self.truncated_committed_seen[i] {
+                self.truncated_committed_seen[i] = n;
+                self.report.add(Violation::new(
+                    "truncated_committed",
+                    now,
+                    Some(NodeId(i as u32)),
+                    format!(
+                        "node truncated its log at or below its own commit index                          (commit {})",
+                        s.raft.commit_index()
+                    ),
+                ));
+            }
+        }
         let views: Vec<NodeView> = (0..self.cfg.servers)
             .map(|i| {
                 let id = NodeId(i as u32);

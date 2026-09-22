@@ -318,6 +318,22 @@ mod tests {
     }
 
     #[test]
+    fn a_follower_only_acknowledges_what_it_has_verified() {
+        // Regression for the matchIndex bug. With two-entry batches, a follower
+        // used to acknowledge its whole durable log -- including an older-term
+        // suffix the leader had never compared -- and the leader committed
+        // entries that follower did not hold. Seed 388 overwrote committed data.
+        let mut cfg = SimConfig::with_seed(388);
+        cfg.raft.max_batch = 2;
+        cfg.duration = 8 * SECONDS;
+        cfg.settle = 12 * SECONDS;
+        cfg.drain = 3 * SECONDS;
+        cfg.normalise();
+        let out = run(cfg);
+        assert!(!out.failed(), "{}", out.detail());
+    }
+
+    #[test]
     fn config_normalisation_keeps_the_window_inside_the_run() {
         let mut cfg = SimConfig {
             duration: 3 * SECONDS,

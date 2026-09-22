@@ -312,6 +312,10 @@ enum Persist {
         /// whole prefix if those batches confirmed first.
         from: u64,
         index: u64,
+        /// Highest index verified to match the leader's log. A follower may
+        /// only acknowledge up to here, however much more of its own log is
+        /// durable. `u64::MAX` for writes that answer nobody.
+        verified: u64,
         reply_to: Option<NodeId>,
         reply_term: u64,
     },
@@ -464,6 +468,9 @@ pub struct RaftStats {
     pub truncations: u64,
     pub step_downs: u64,
     pub bad_messages: u64,
+    /// Truncations that cut at or below this node's own commit index. Must
+    /// stay zero; counted rather than asserted so release builds report it.
+    pub truncated_committed: u64,
 }
 
 pub struct Raft {
@@ -770,7 +777,7 @@ impl Raft {
             index,
             cmd,
         });
-        self.persist_log_from(io, index, false, None, 0);
+        self.persist_log_from(io, index, false, None, 0, u64::MAX);
         self.broadcast_append(io);
         Some(index)
     }
@@ -938,7 +945,7 @@ impl Raft {
             index,
             cmd: Command::noop(),
         });
-        self.persist_log_from(io, index, false, None, 0);
+        self.persist_log_from(io, index, false, None, 0, u64::MAX);
 
         self.election_timer.disarm(io);
         self.broadcast_append(io);
@@ -1093,13 +1100,21 @@ impl Raft {
                 let batch = self.persister.start(Persist::LogDurable {
                     from: start,
                     index: self.log.last_index(),
+                    verified: last_new_index,
                     reply_to: Some(from),
                     reply_term: self.term,
                 });
                 self.write_hard_state(io, batch);
                 self.write_log_from(io, batch, start, conflict_at.is_some());
             } else {
-                self.persist_log_from(io, start, conflict_at.is_some(), Some(from), self.term);
+                self.persist_log_from(
+                    io,
+                    start,
+                    conflict_at.is_some(),
+                    Some(from),
+                    self.term,
+                    last_new_index,
+                );
             }
             if self.cfg.bug == InjectedBug::AckBeforeSync {
                 // The defect: answer now, claiming everything in memory is
@@ -1120,19 +1135,21 @@ impl Raft {
             let batch = self.persister.start(Persist::LogDurable {
                 from: self.durable_index + 1,
                 index: self.durable_index,
+                verified: last_new_index,
                 reply_to: Some(from),
                 reply_term: self.term,
             });
             self.write_hard_state(io, batch);
         } else {
-            // Nothing new to persist: answer with what is already durable.
+            // Nothing new to persist: answer with what is already durable --
+            // but only as far as this message proved the logs agree.
             self.send(
                 io,
                 from,
                 RaftMsg::AppendEntriesResp {
                     term: self.term,
                     success: true,
-                    match_index: self.durable_index,
+                    match_index: self.durable_index.min(last_new_index),
                     conflict_index: NO_INDEX,
                 },
             );
@@ -1167,11 +1184,20 @@ impl Raft {
     }
 
     fn truncate(&mut self, io: &mut dyn Io, at: u64) {
-        debug_assert!(
-            at > self.commit_index,
-            "committed entries must never be truncated: at={at} commit={}",
-            self.commit_index
-        );
+        // Not a debug_assert!: sweeps run in release, and this is exactly the
+        // condition that has to be visible there.
+        if at <= self.commit_index {
+            self.stats.truncated_committed += 1;
+            io.trace(
+                Level::Error,
+                "raft",
+                format!(
+                    "truncating committed entries: at={at} commit={} last={}",
+                    self.commit_index,
+                    self.log.last_index()
+                ),
+            );
+        }
         self.stats.truncations += 1;
         io.trace(
             Level::Info,
@@ -1308,10 +1334,12 @@ impl Raft {
         truncated: bool,
         reply_to: Option<NodeId>,
         reply_term: u64,
+        verified: u64,
     ) {
         let batch = self.persister.start(Persist::LogDurable {
             from,
             index: self.log.last_index(),
+            verified,
             reply_to,
             reply_term,
         });
@@ -1368,6 +1396,7 @@ impl Raft {
             Persist::LogDurable {
                 from,
                 index,
+                verified,
                 reply_to,
                 reply_term,
             } => {
@@ -1385,15 +1414,20 @@ impl Raft {
                     self.advance_durable(io);
                 }
                 if let Some(to) = reply_to {
-                    // Only claim what is durable *and* still ours: a truncation
-                    // may have overtaken this batch.
+                    // Only claim what is durable, still ours, *and* verified to
+                    // match the leader. The last part is Raft's matchIndex rule
+                    // and it is easy to miss: this node's durable log may run
+                    // on past the entries the leader just sent, into a suffix
+                    // from an older term that nobody has compared yet.
+                    // Acknowledging that suffix lets the leader count this node
+                    // as holding entries it does not have -- and commit them.
                     self.send(
                         io,
                         to,
                         RaftMsg::AppendEntriesResp {
                             term: reply_term,
                             success: true,
-                            match_index: self.durable_index,
+                            match_index: self.durable_index.min(verified),
                             conflict_index: NO_INDEX,
                         },
                     );
@@ -1641,6 +1675,7 @@ mod tests {
         let b = p.start(Persist::LogDurable {
             from: 5,
             index: 10,
+            verified: u64::MAX,
             reply_to: None,
             reply_term: 0,
         });
@@ -1654,6 +1689,7 @@ mod tests {
                 action: Persist::LogDurable {
                     from: 5,
                     index: 6,
+                    verified: u64::MAX,
                     reply_to: None,
                     reply_term: 0
                 },

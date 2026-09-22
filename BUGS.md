@@ -174,47 +174,56 @@ seeds.
 
 ---
 
-## Open: committed entries overwritten under small batches
+## 4. Acknowledging entries nobody had compared
 
-**Status: found, not fixed.** Reproduces at
+**Severity: committed data overwritten.** Found by `--max-batch 2`; seed 388
+replaced a committed term-8 entry with a term-7 one.
+
+**Reproduces (before the fix):**
 `sim run --seed 388 --max-batch 2 --duration 8000 --settle 12000 --drain 3000`
-(1 seed in 1000 at that configuration; the default `--max-batch 64` is clean
-over 2000 seeds).
 
-A committed entry is overwritten by one from an *earlier* term:
+A follower that accepted an `AppendEntries` replied with `match_index` set to
+its **whole durable log**. Raft's rule is narrower: a follower may only
+acknowledge `prev_index + entries.len()` -- the prefix this message actually
+proved agrees with the leader. Past that point the follower's log can run on
+into a suffix from an older term that nobody has compared yet.
 
-```
-committed index 96 was term 8 Noop, now term 7 Put{k2, c2v22}
-committed index 96 (term 8) is on stable storage on 0 of 3 nodes
-```
+With 64-entry batches the leader always sent everything to the end of its log,
+so any divergent suffix was compared -- and truncated -- in the same message
+before the ack went out. The bug was invisible. With two-entry batches:
 
-What the trace shows, and what it rules out:
+1. Node 2, an old leader partitioned away, holds term-7 entries up to 97.
+2. Node 0, leader of term 9, sends entries 94–95. They match. Node 2 replies
+   "durable through 97" -- its own term-7 97.
+3. Node 0 counts node 2 as holding its term-8/9 entries at 96–97, reaches a
+   quorum, and commits them.
+4. Node 2 later wins an election -- legitimately, against a third node whose log
+   was shorter -- and overwrites the committed entries everywhere.
 
-- No `durable_claim_unbacked` fires at any event, so every acknowledgement was
-  honestly backed by that node's disk at the moment it was sent.
-- No `durable_entry_lost` fires, so no restart discarded anything a node had
-  claimed was synced.
-- n0 holds the committed entries (`log=97 durable=97 term=9`, undamaged) and
-  correctly **refuses** to vote for n2: `granted=false (up_to_date=false)`.
-- n1 grants: `granted=true (up_to_date=true)` -- and n1's log is `last=(77,7)`
-  against n2's offered `last=(97,7)`. Same term, longer log. **Under Raft's
-  election restriction that vote is correct.**
+Finding it took three wrong turns, recorded because the process is the point:
+the bad election looked like the bug (it was legal under the election
+restriction); then truncation of committed entries looked likely (promoting the
+release-invisible `debug_assert!` in `truncate()` to a reported violation showed
+it never happened); then a lost hard-state write (a real hole, fixed, but not
+this one -- the fingerprint did not move). The trace of *who acknowledged what*
+is what finally showed it.
 
-So the bad election is a symptom, not the cause. The real question is how n1
-came to be missing entries 78..97 that a quorum had committed: whether it
-truncated them while following a stale leader, or a leader counted an
-acknowledgement that a follower later walked back. `truncate()` guards against
-cutting below the commit index with a `debug_assert!`, which does not run in
-release builds, so that path is currently unobserved.
+**Fix:** every acknowledgement is capped at the verified prefix. The deferred
+reply carries it through the persist batch, so an ack that waits for an `fsync`
+is capped the same way as one sent immediately. Batch sizes 1, 2 and 4 are now
+clean over 1000 seeds each, and seed 388 is a regression test.
 
-Next step is to promote that assertion into a reported violation and re-run the
-seed, which will say directly whether a node is truncating committed entries.
+**Related, found on the way:** an entry is now only reported durable once the
+term that authorised it is durable too, because recovery discards entries ahead
+of the hard state. And `truncated_committed` is now a checked invariant in
+release builds.
 
 ---
 
 ## Current status
 
 ```
+3000 seeds at --max-batch 1, 2, 4  → no failures
 5000 seeds, 3-node cluster, crashes + partitions + clock skew + torn writes
   → 45.2M events, 2.4M operations checked, no failures
 
