@@ -302,6 +302,7 @@ mod tests {
                 (None, Some(why)) => {
                     println!("{} NOT caught (known gap): {why}", bug.name());
                 }
+                #[allow(unreachable_patterns)]
                 (None, None) => panic!(
                     "the checkers did not notice a store that {} within 400 seeds",
                     bug.describe()

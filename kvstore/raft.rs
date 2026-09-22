@@ -93,13 +93,14 @@ impl InjectedBug {
     /// Being explicit about this matters more than a green test: a harness is
     /// only as good as the failures it can actually see, and pretending
     /// otherwise is how a suite becomes decorative.
+    ///
+    /// Currently empty, and it took work to get there. `CommitAnyTerm` went
+    /// unseen in 5000 seeds while the checkers only watched for the *damage* it
+    /// causes -- damage that needs a leader to die inside a narrow window. It is
+    /// now caught in half of all runs by checking the rule itself: a leader may
+    /// only advance its commit index onto an entry from its own term.
     pub fn detection_gap(self) -> Option<&'static str> {
-        match self {
-            InjectedBug::CommitAnyTerm => Some(
-                "a new leader appends a no-op of its own term immediately, so the entry crossing the commit threshold is nearly always a current-term one anyway. The early commit is real but almost always harmless; turning it into lost data needs the leader to die in the window before its no-op replicates. Not seen in 5000 seeds at the default batch size. It IS reachable with --max-batch 2, where followers acknowledge at an old-term index.",
-            ),
-            _ => None,
-        }
+        None
     }
 
     pub fn describe(self) -> &'static str {

@@ -78,6 +78,13 @@ pub struct FaultConfig {
     /// reaches them only by luck. Aiming at the leader walks the cluster
     /// through those windows deliberately.
     pub leader_bias_ppm: u32,
+    /// How often a crash targets a node that is holding unsynced writes.
+    ///
+    /// A durability bug only bites if the node dies while data it has acted on
+    /// is still in the page cache. That window is short, so crashing uniformly
+    /// misses it almost every time; aiming at it turns a rare coincidence into
+    /// a routine event.
+    pub unsynced_bias_ppm: u32,
 }
 
 impl Default for FaultConfig {
@@ -102,6 +109,7 @@ impl Default for FaultConfig {
             max_clock_skew: 50 * crate::MILLIS,
             max_clock_jump: 500 * crate::MILLIS,
             leader_bias_ppm: 300_000,
+            unsynced_bias_ppm: 500_000,
         }
     }
 }
@@ -166,6 +174,21 @@ pub struct FaultStats {
     pub slow_links: u64,
     /// Faults aimed at the leader rather than a random node.
     pub leader_targeted: u64,
+    /// Crashes aimed at a node holding unsynced writes.
+    pub unsynced_targeted: u64,
+}
+
+/// What the driver knows about the cluster, for aiming faults.
+///
+/// The injector lives in `simcore` and deliberately knows nothing about
+/// consensus; this is the narrow channel through which the layer that *does*
+/// know can say where a fault would be most revealing.
+#[derive(Default)]
+pub struct FaultHint<'a> {
+    /// Whoever currently believes they are leading, if anyone.
+    pub leader: Option<NodeId>,
+    /// Per node: is it holding writes it has not synced?
+    pub unsynced: &'a [bool],
 }
 
 pub struct FaultInjector {
@@ -221,15 +244,18 @@ impl FaultInjector {
     ///
     /// `None` means "do nothing this tick", which is itself important: a
     /// cluster that is never left alone never gets to demonstrate progress.
-    /// `leader` is whoever the cluster currently believes is in charge, if
-    /// anyone; it is used to aim faults rather than scatter them.
+    /// Choose the next fault.
+    ///
+    /// `hint` is what the driver knows about the cluster right now. It is used
+    /// to aim faults rather than scatter them: see [`FaultHint`].
     pub fn decide(
         &mut self,
         rng: &mut Rng,
         now: Nanos,
         up: &[bool],
-        leader: Option<NodeId>,
+        hint: &FaultHint,
     ) -> Option<FaultAction> {
+        let leader = hint.leader;
         if now >= self.cfg.window.1 {
             if !self.recovered {
                 self.recovered = true;
@@ -279,10 +305,22 @@ impl FaultInjector {
         let action = match choice {
             FaultChoice::Crash => {
                 self.stats.crashes += 1;
+                // Aim, in order of how much a crash there is likely to reveal:
+                // the leader, then whoever is holding unsynced writes, then
+                // anyone at all.
+                let dirty: Vec<NodeId> = alive
+                    .iter()
+                    .copied()
+                    .filter(|n| hint.unsynced.get(n.idx()).copied().unwrap_or(false))
+                    .collect();
                 let target = match leader {
                     Some(l) if alive.contains(&l) && rng.chance_ppm(c.leader_bias_ppm) => {
                         self.stats.leader_targeted += 1;
                         l
+                    }
+                    _ if !dirty.is_empty() && rng.chance_ppm(c.unsynced_bias_ppm) => {
+                        self.stats.unsynced_targeted += 1;
+                        *rng.choose(&dirty)?
                     }
                     _ => *rng.choose(&alive)?,
                 };
@@ -387,7 +425,10 @@ mod tests {
         let mut inj = FaultInjector::new(FaultConfig::none());
         let mut rng = Rng::new(1);
         for t in 0..1000 {
-            assert_eq!(inj.decide(&mut rng, t, &[true; 3], None), None);
+            assert_eq!(
+                inj.decide(&mut rng, t, &[true; 3], &FaultHint::default()),
+                None
+            );
         }
     }
 
@@ -399,16 +440,22 @@ mod tests {
         };
         let mut inj = FaultInjector::new(cfg);
         let mut rng = Rng::new(1);
-        assert_eq!(inj.decide(&mut rng, 50, &[true; 5], None), None);
+        assert_eq!(
+            inj.decide(&mut rng, 50, &[true; 5], &FaultHint::default()),
+            None
+        );
         let during: Vec<_> = (100..200)
-            .filter_map(|t| inj.decide(&mut rng, t, &[true; 5], None))
+            .filter_map(|t| inj.decide(&mut rng, t, &[true; 5], &FaultHint::default()))
             .collect();
         assert!(!during.is_empty(), "expected faults inside the window");
         assert_eq!(
-            inj.decide(&mut rng, 250, &[true; 5], None),
+            inj.decide(&mut rng, 250, &[true; 5], &FaultHint::default()),
             Some(FaultAction::Recover)
         );
-        assert_eq!(inj.decide(&mut rng, 260, &[true; 5], None), None);
+        assert_eq!(
+            inj.decide(&mut rng, 260, &[true; 5], &FaultHint::default()),
+            None
+        );
     }
 
     #[test]
@@ -417,7 +464,7 @@ mod tests {
         let mut rng = Rng::new(7);
         let mut up = [true; 5];
         for t in 0..20_000 {
-            match inj.decide(&mut rng, t, &up, None) {
+            match inj.decide(&mut rng, t, &up, &FaultHint::default()) {
                 Some(FaultAction::Crash(n)) => up[n.idx()] = false,
                 Some(FaultAction::Restart(n)) => up[n.idx()] = true,
                 _ => {}
@@ -438,7 +485,7 @@ mod tests {
         let mut up = [true; 3];
         let mut saw_majority_down = false;
         for t in 0..20_000 {
-            match inj.decide(&mut rng, t, &up, None) {
+            match inj.decide(&mut rng, t, &up, &FaultHint::default()) {
                 Some(FaultAction::Crash(n)) => up[n.idx()] = false,
                 Some(FaultAction::Restart(n)) => up[n.idx()] = true,
                 _ => {}
@@ -457,7 +504,7 @@ mod tests {
         let mut rng = Rng::new(3);
         let up = [true, false, true, true, false];
         for t in 0..5_000 {
-            match inj.decide(&mut rng, t, &up, None) {
+            match inj.decide(&mut rng, t, &up, &FaultHint::default()) {
                 Some(FaultAction::Crash(n)) => assert!(up[n.idx()]),
                 Some(FaultAction::Restart(n)) => assert!(!up[n.idx()]),
                 _ => {}
@@ -471,7 +518,8 @@ mod tests {
         let mut rng = Rng::new(5);
         let mut seen = 0;
         for t in 0..5_000 {
-            if let Some(FaultAction::Partition(groups)) = inj.decide(&mut rng, t, &[true; 5], None)
+            if let Some(FaultAction::Partition(groups)) =
+                inj.decide(&mut rng, t, &[true; 5], &FaultHint::default())
             {
                 seen += 1;
                 assert_eq!(groups.len(), 2);
@@ -508,7 +556,14 @@ mod tests {
             let mut inj = FaultInjector::new(cfg_all_on());
             let mut rng = Rng::new(1234);
             (0..2000)
-                .filter_map(|t| inj.decide(&mut rng, t, &[true, true, false, true, true], None))
+                .filter_map(|t| {
+                    inj.decide(
+                        &mut rng,
+                        t,
+                        &[true, true, false, true, true],
+                        &FaultHint::default(),
+                    )
+                })
                 .map(|a| format!("{a:?}"))
                 .collect::<Vec<_>>()
         };

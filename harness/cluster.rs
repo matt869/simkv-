@@ -23,10 +23,10 @@ use checker::invariants::{Invariants, NodeView};
 use checker::linearizability::{Checker, History, Verdict};
 use checker::{Report, Violation};
 use kvstore::log::{Entry, RaftLog};
-use kvstore::raft::Role;
+use kvstore::raft::{RaftMsg, Role};
 use kvstore::{KvServer, Message};
 use sim_io::{SimIo, FILE_WAL};
-use simcore::faults::FaultAction;
+use simcore::faults::{FaultAction, FaultHint};
 use simcore::scheduler::{Event, Fired};
 use simcore::trace::Level;
 use simcore::{Nanos, NodeId, World, WorldConfig};
@@ -58,6 +58,14 @@ pub struct Cluster {
     empty_log: RaftLog,
     /// Per-node count of committed-entry truncations already reported.
     truncated_committed_seen: Vec<u64>,
+    /// Highest durable index ever observed for each node, across incarnations.
+    ///
+    /// An acknowledgement is compared against this rather than the node's
+    /// current value, because a crash legitimately lowers the current one after
+    /// the message was already in flight. The high-water mark only grows, so a
+    /// match_index above it is proof the node acknowledged data it had never
+    /// synced -- with no false positives.
+    durable_high_water: Vec<u64>,
 
     events: u64,
     incomplete: bool,
@@ -106,6 +114,7 @@ impl Cluster {
             .collect();
 
         let truncated_committed_seen = vec![0; servers.len()];
+        let cfg_servers = servers.len();
         Cluster {
             world,
             servers,
@@ -119,6 +128,7 @@ impl Cluster {
             acted_term: BTreeMap::new(),
             empty_log: RaftLog::new(),
             truncated_committed_seen,
+            durable_high_water: vec![0; cfg_servers],
             events: 0,
             incomplete: false,
             finished: false,
@@ -237,6 +247,29 @@ impl Cluster {
                 self.invariants.note_sent(from, term);
                 let e = self.acted_term.entry(from).or_insert(0);
                 *e = (*e).max(term);
+
+                // The fsync rule, stated directly: a follower may never
+                // acknowledge more of its log than it has made durable. The
+                // leader commits on these numbers, so an inflated one is a
+                // promise the disk was never asked to keep.
+                if let RaftMsg::AppendEntriesResp {
+                    success: true,
+                    match_index,
+                    ..
+                } = m
+                {
+                    let seen = self.durable_high_water[from.idx()];
+                    if match_index > seen {
+                        self.report.add(Violation::new(
+                            "ack_beyond_durable",
+                            now,
+                            Some(from),
+                            format!(
+                                "acknowledged match_index {match_index}, but has never had                                  more than {seen} entries durable"
+                            ),
+                        ));
+                    }
+                }
             }
         }
         if !self.world.accept_delivery(from, to) {
@@ -257,11 +290,14 @@ impl Cluster {
         match tag {
             APP_FAULT_TICK => {
                 let up: Vec<bool> = self.world.up_flags()[..self.cfg.servers].to_vec();
-                let leader = self.current_leader();
-                if let Some(action) =
-                    self.world
-                        .faults
-                        .decide(&mut self.world.rng, now, &up, leader)
+                let hint = FaultHint {
+                    leader: self.current_leader(),
+                    unsynced: &self.unsynced_flags(),
+                };
+                if let Some(action) = self
+                    .world
+                    .faults
+                    .decide(&mut self.world.rng, now, &up, &hint)
                 {
                     self.apply_fault(action, now);
                 }
@@ -455,6 +491,16 @@ impl Cluster {
         best.map(|(_, id)| id)
     }
 
+    /// Which servers are holding writes they have not synced.
+    fn unsynced_flags(&self) -> Vec<bool> {
+        (0..self.cfg.servers)
+            .map(|i| {
+                let id = NodeId(i as u32);
+                self.world.is_up(id) && self.world.has_unsynced(id, FILE_WAL)
+            })
+            .collect()
+    }
+
     fn is_client(&self, node: NodeId) -> bool {
         node.idx() >= self.cfg.servers
     }
@@ -535,6 +581,12 @@ impl Cluster {
                 }
             })
             .collect();
+        for v in &views {
+            let i = v.id.idx();
+            if v.up && v.durable_index > self.durable_high_water[i] {
+                self.durable_high_water[i] = v.durable_index;
+            }
+        }
         let found = self.invariants.observe(now, &views);
         self.report.extend(found);
     }

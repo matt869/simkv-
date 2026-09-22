@@ -130,47 +130,61 @@ A harness that has never failed is indistinguishable from one that cannot fail.
 asserts each is detected, and `an_unmodified_store_survives_the_same_seeds` is
 the control.
 
-| Defect | Detection |
-|---|---|
-| `no-dedup` — retried requests apply twice | 283 of 300, as `linearizability` |
-| `truncate-on-any-append` — trust the leader's length blindly | 300 of 300, as `commit_beyond_log` |
-| `ack-before-sync` — acknowledge before `fsync` | 1 in 300, as `leader_completeness` |
-| `vote-before-sync` — reveal a vote before it is durable | 266 of 300 (was 5 of 300 before leader-biased faults) |
-| `commit-any-term` — Raft Figure 8 | not caught in 5000 seeds at the default batch size; **1 in 300 with `--max-batch 2`** |
+| Defect | Detection | Caught by |
+|---|---|---|
+| `ack-before-sync` — acknowledge before `fsync` | 300 of 300 | `ack_beyond_durable` |
+| `commit-any-term` — Raft Figure 8 | 156 of 300 | `commit_of_foreign_term` |
+| `vote-before-sync` — reveal a vote before it is durable | 268 of 300 | `durable_term_lost` |
+| `no-dedup` — retried requests apply twice | 288 of 300 | `linearizability` |
+| `truncate-on-any-append` — trust the leader's length | 300 of 300 | `commit_beyond_log` |
 
-### Closing the gap: aim the faults
+There is no longer a defect on this list the harness cannot see, and the test
+that asserts it is strict: no known-gap escape hatch.
 
-`commit-any-term` escaped 5000 uniformly-random seeds. Two changes to the fault
-model were tried, and the result is a useful lesson about what a fault injector
-is actually for.
+### Check the rule, not just the damage
 
-**Leader-biased crashes** (`leader_bias_ppm`, default 30%) aim crashes and
-isolations at whoever currently believes they are leading, rather than at a node
-picked uniformly. The interesting windows in a consensus protocol are all around
-a leadership change, and uniform faults reach them only by luck.
+Two of these defects were nearly invisible, and the fix for both was the same
+realisation.
 
-This did not catch `commit-any-term` -- but it moved `vote-before-sync` from
-5 seeds in 300 to **266 in 300**, a fifty-fold improvement, because that defect
-also needs a crash inside a leadership window.
+`commit-any-term` escaped 5000 seeds. `ack-before-sync` was found in 1 seed in
+300. Both were being detected only by the *damage* they eventually cause, and
+that damage needs a long coincidence: for the premature commit to matter, a
+leader has to die inside a narrow window; for the premature acknowledgement to
+matter, enough nodes holding the data have to lose it while the leader — which
+synced honestly — is also gone.
 
-It also made `ack-before-sync` *harder* to find, from roughly 1 in 40 to 1 in
-300: that defect is a lying **follower**, and crashing leaders more often means
-crashing followers less often. Aiming faults is a trade, not a free win. That is
-why the bias is a tunable rather than a rule, and why the detection test now
-sweeps 400 seeds in parallel instead of asserting against a threshold that sat
-just above the observed rate.
+Two rounds of aiming the fault injector helped, but not enough:
 
-**Small replication batches** (`--max-batch 2`) did catch it, at 1 seed in 300.
-The reason is precise: with a large batch the leader sends its new no-op
-*together* with the older entries, so a follower acknowledges both at once and
-the correct and the buggy commit rules agree. Only when entries arrive in small
-batches does a follower acknowledge at an old-term index -- which is exactly the
-situation Raft's commit rule exists for.
+**Leader-biased faults** (`leader_bias_ppm`, 30%) aim crashes and isolations at
+whoever believes they are leading. This moved `vote-before-sync` from 5 seeds in
+300 to 268, because that defect also needs a crash in a leadership window. It
+made `ack-before-sync` *harder* to find, from 1 in 40 to 1 in 300, because that
+one is a lying **follower** and crashing leaders more means crashing followers
+less. Aiming faults is a trade, not a free win.
 
-The lesson is that the search was never the limiting factor. The defect was
-unreachable under the default configuration and trivially reachable one flag
-away; what needed widening was the space of *configurations*, not the number of
-seeds.
+**Unsynced-biased crashes** (`unsynced_bias_ppm`, 50%) aim at nodes holding
+writes they have not synced — precisely the window a durability bug needs. This
+was the right idea and still only moved `ack-before-sync` from 1 in 300 to 2.
+
+What actually worked was checking the **rule** rather than waiting for the
+consequence:
+
+- `ack_beyond_durable`: a follower may never acknowledge a `match_index` larger
+  than it has ever had durable. Compared against a per-node high-water mark, so
+  a crash legitimately lowering the current value cannot cause a false positive.
+  1 in 300 → **300 of 300**.
+- `commit_of_foreign_term`: a leader may only advance its commit index onto an
+  entry from its own term. Not caught in 5000 → **156 of 300**.
+
+Both checks are one line of Raft restated as an assertion, and both fire on the
+first offending event rather than seconds later at the wreckage. Aiming faults
+widens the space you search; checking rules shortens the distance between a
+mistake and a report. The second is worth more.
+
+A caveat recorded honestly: `commit-any-term` had briefly been reachable at
+`--max-batch 2`, at 1 seed in 300. Fixing bug 4 removed that path — the
+acknowledgement it depended on was itself the bug — and it went back to
+undetectable until `commit_of_foreign_term` existed.
 
 ---
 
@@ -223,7 +237,9 @@ release builds.
 ## Current status
 
 ```
-3000 seeds at --max-batch 1, 2, 4  → no failures
+6000 seeds across six configurations → no failures
+  (default; --max-batch 1; --max-batch 2; 5 servers + small batches;
+   5 servers, 8 clients, 2 keys; and majority-failure allowed)
 5000 seeds, 3-node cluster, crashes + partitions + clock skew + torn writes
   → 45.2M events, 2.4M operations checked, no failures
 

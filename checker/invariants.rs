@@ -221,6 +221,28 @@ impl Invariants {
             ));
         }
 
+        // --- the commit rule -------------------------------------------
+        // Raft Figure 8: a leader may only advance its commit index onto an
+        // entry from its *own* term. Counting replicas of an older entry can
+        // commit something a later leader is still entitled to overwrite.
+        // Entries below that point are committed implicitly and are fine; it is
+        // the index the leader actually lands on that must be current-term.
+        if v.role == Role::Leader && v.commit_index > prev_commit && !restarted {
+            if let Some(t) = v.log.term_at(v.commit_index) {
+                if t != v.term {
+                    out.push(Violation::new(
+                        "commit_of_foreign_term",
+                        time,
+                        Some(v.id),
+                        format!(
+                            "leader of term {} advanced commit to index {}, whose entry is from                              term {t}",
+                            v.term, v.commit_index
+                        ),
+                    ));
+                }
+            }
+        }
+
         // --- election safety -------------------------------------------
         if v.role == Role::Leader {
             match self.leader_by_term.get(&v.term) {

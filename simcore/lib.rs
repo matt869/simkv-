@@ -261,6 +261,12 @@ impl World {
         self.disks[node.idx()].durable_image(file)
     }
 
+    /// Whether this node has writes that a crash right now would resolve by
+    /// the fault model -- i.e. data it may have acted on but has not synced.
+    pub fn has_unsynced(&self, node: NodeId, file: FileId) -> bool {
+        self.disks[node.idx()].has_unsynced(file)
+    }
+
     pub fn disk_stats(&self, node: NodeId) -> DiskStats {
         self.disks[node.idx()].stats()
     }
