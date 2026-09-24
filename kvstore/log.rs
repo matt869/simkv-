@@ -195,6 +195,13 @@ pub struct RaftLog {
     /// append, which turns replication into quadratic work.
     offsets: Vec<usize>,
     end: usize,
+    /// Last index covered by the snapshot; entries at or below it have been
+    /// compacted away. Zero means nothing has been compacted.
+    snapshot_index: u64,
+    /// Term of the entry at `snapshot_index`, kept because log matching still
+    /// has to answer questions about that one boundary index long after the
+    /// entry itself is gone.
+    snapshot_term: u64,
 }
 
 impl RaftLog {
@@ -203,10 +210,72 @@ impl RaftLog {
     }
 
     pub fn from_entries(entries: Vec<Entry>) -> RaftLog {
-        let mut log = RaftLog::new();
+        RaftLog::from_snapshot(0, 0, entries)
+    }
+
+    /// Build a log that begins after a snapshot at `(index, term)`, laid out
+    /// from the start of the log region.
+    pub fn from_snapshot(index: u64, term: u64, entries: Vec<Entry>) -> RaftLog {
+        let mut log = RaftLog {
+            snapshot_index: index,
+            snapshot_term: term,
+            ..RaftLog::new()
+        };
         for e in entries {
             log.append(e);
         }
+        debug_assert!(log.is_well_formed());
+        log
+    }
+
+    /// Last index the snapshot covers. Entries at or below it are gone.
+    pub fn snapshot_index(&self) -> u64 {
+        self.snapshot_index
+    }
+
+    pub fn snapshot_term(&self) -> u64 {
+        self.snapshot_term
+    }
+
+    /// Lowest index still held as an entry.
+    pub fn first_index(&self) -> u64 {
+        self.snapshot_index + 1
+    }
+
+    /// Discard every entry up to and including `index`, which the snapshot now
+    /// covers. The caller must have made that snapshot durable first.
+    pub fn compact_to(&mut self, index: u64, term: u64) {
+        if index <= self.snapshot_index || index > self.last_index() {
+            return;
+        }
+        let drop_count = (index - self.snapshot_index) as usize;
+        self.entries.drain(..drop_count);
+        self.offsets.drain(..drop_count);
+        self.snapshot_index = index;
+        self.snapshot_term = term;
+        // Offsets are absolute within the log region and deliberately left
+        // alone. The write-ahead file is append-only -- see `compaction` in the
+        // module docs -- so a surviving entry keeps the byte position it was
+        // written at.
+    }
+
+    /// Rebuild a log from a recovered file: entries, their byte offsets within
+    /// the log region, and where the valid region ends.
+    pub fn from_parts(
+        snapshot_index: u64,
+        snapshot_term: u64,
+        entries: Vec<Entry>,
+        offsets: Vec<usize>,
+        end: usize,
+    ) -> RaftLog {
+        debug_assert_eq!(entries.len(), offsets.len());
+        let log = RaftLog {
+            entries,
+            offsets,
+            end,
+            snapshot_index,
+            snapshot_term,
+        };
         debug_assert!(log.is_well_formed());
         log
     }
@@ -215,7 +284,7 @@ impl RaftLog {
         self.entries
             .iter()
             .enumerate()
-            .all(|(i, e)| e.index == i as u64 + 1)
+            .all(|(i, e)| e.index == self.snapshot_index + i as u64 + 1)
             && self.entries.windows(2).all(|w| w[0].term <= w[1].term)
     }
 
@@ -228,24 +297,32 @@ impl RaftLog {
     }
 
     pub fn last_index(&self) -> u64 {
-        self.entries.last().map_or(NO_INDEX, |e| e.index)
+        self.entries.last().map_or(self.snapshot_index, |e| e.index)
     }
 
     pub fn last_term(&self) -> u64 {
-        self.entries.last().map_or(0, |e| e.term)
+        self.entries.last().map_or(self.snapshot_term, |e| e.term)
     }
 
     pub fn get(&self, index: u64) -> Option<&Entry> {
-        if index == NO_INDEX || index > self.last_index() {
+        if index < self.first_index() || index > self.last_index() {
             return None;
         }
-        self.entries.get((index - 1) as usize)
+        self.entries.get((index - self.first_index()) as usize)
     }
 
-    /// Term of the entry at `index`; index 0 is term 0 by definition.
+    /// Term of the entry at `index`, or `None` if the log cannot say.
+    ///
+    /// Index 0 is term 0 by definition, and the snapshot boundary keeps its
+    /// term after the entry is compacted away. Anything below that boundary is
+    /// genuinely unknown, which is not the same as absent: callers must not
+    /// read `None` as a mismatch.
     pub fn term_at(&self, index: u64) -> Option<u64> {
         if index == NO_INDEX {
             return Some(0);
+        }
+        if index == self.snapshot_index {
+            return Some(self.snapshot_term);
         }
         self.get(index).map(|e| e.term)
     }
@@ -271,14 +348,11 @@ impl RaftLog {
         self.entries.push(entry);
     }
 
-    /// Discard `index` and everything after it.
+    /// Discard `index` and everything after it. Never cuts into the snapshot.
     pub fn truncate_from(&mut self, index: u64) {
-        if index == NO_INDEX {
-            self.entries.clear();
-            self.offsets.clear();
-            self.end = 0;
-        } else if index <= self.last_index() {
-            let i = (index - 1) as usize;
+        let index = index.max(self.first_index());
+        if index <= self.last_index() {
+            let i = (index - self.first_index()) as usize;
             self.end = self.offsets[i];
             self.entries.truncate(i);
             self.offsets.truncate(i);
@@ -287,10 +361,10 @@ impl RaftLog {
 
     /// Up to `max` entries starting at `index`.
     pub fn slice_from(&self, index: u64, max: usize) -> Vec<Entry> {
-        if index == NO_INDEX || index > self.last_index() {
+        if index < self.first_index() || index > self.last_index() {
             return Vec::new();
         }
-        let start = (index - 1) as usize;
+        let start = (index - self.first_index()) as usize;
         let end = (start + max).min(self.entries.len());
         self.entries[start..end].to_vec()
     }
@@ -311,7 +385,7 @@ impl RaftLog {
     ///
     /// Terms along a log never decrease, so this is a partition point.
     pub fn last_index_with_term_at_most(&self, term: u64) -> u64 {
-        self.entries.partition_point(|e| e.term <= term) as u64
+        self.snapshot_index + self.entries.partition_point(|e| e.term <= term) as u64
     }
 
     /// Total bytes this log occupies on disk, for keeping the file length and
@@ -323,10 +397,10 @@ impl RaftLog {
     /// Byte offset at which the record for `index` begins. `last_index() + 1`
     /// gives the end of the log, which is where the next record goes.
     pub fn byte_offset_of(&self, index: u64) -> usize {
-        if index == NO_INDEX {
+        if index < self.first_index() {
             return 0;
         }
-        match self.offsets.get((index - 1) as usize) {
+        match self.offsets.get((index - self.first_index()) as usize) {
             Some(o) => *o,
             None => self.end,
         }
@@ -337,6 +411,8 @@ impl RaftLog {
 #[derive(Clone, Debug)]
 pub struct RecoveredLog {
     pub entries: Vec<Entry>,
+    /// Byte offset of each entry, relative to the start of the log region.
+    pub offsets: Vec<usize>,
     /// Bytes that form a valid prefix. The file should be truncated here.
     pub valid_bytes: usize,
     /// Whether anything was discarded (a torn tail, a hole, or corruption).
@@ -344,8 +420,12 @@ pub struct RecoveredLog {
 }
 
 /// Read a log file, stopping at the first record that is not intact.
-pub fn recover_log(bytes: &[u8]) -> RecoveredLog {
+///
+/// `first_index` is the index the first record must carry: 1 for a log that has
+/// never been compacted, one past the snapshot otherwise.
+pub fn recover_log_from(bytes: &[u8], first_index: u64) -> RecoveredLog {
     let mut entries: Vec<Entry> = Vec::new();
+    let mut offsets: Vec<usize> = Vec::new();
     let mut pos = 0usize;
     let mut damaged = false;
 
@@ -385,19 +465,130 @@ pub fn recover_log(bytes: &[u8]) -> RecoveredLog {
         };
         // Even an intact record is rejected if it is not the one that should
         // come next: reordered or duplicated writes must not be spliced in.
-        let expected = entries.last().map_or(1, |e: &Entry| e.index + 1);
+        let expected = entries.last().map_or(first_index, |e: &Entry| e.index + 1);
         if entry.index != expected || entry.term < entries.last().map_or(0, |e| e.term) {
             damaged = true;
             break;
         }
         entries.push(entry);
+        offsets.push(pos);
         pos += 8 + len;
     }
 
     RecoveredLog {
         entries,
+        offsets,
         valid_bytes: pos,
         damaged,
+    }
+}
+
+/// Read a log file that has never been compacted.
+pub fn recover_log(bytes: &[u8]) -> RecoveredLog {
+    recover_log_from(bytes, 1)
+}
+
+/// Read a log file whose first record may be at any index.
+///
+/// The write-ahead file is append-only, so after a compaction it still begins
+/// with entries the snapshot has since absorbed. Recovery has to read from
+/// whatever index the file actually starts at and let the caller discard the
+/// part the snapshot covers -- the alternative, rewriting the file to start at
+/// the new first index, would mean a window where the only durable copy of the
+/// live entries is being overwritten.
+pub fn recover_log_any_start(bytes: &[u8]) -> RecoveredLog {
+    if bytes.len() < 8 {
+        return recover_log_from(bytes, 1);
+    }
+    let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    // The index sits after term in the payload: len, crc, then term, index.
+    let first = if len >= 16 && bytes.len() >= 8 + 16 {
+        let mut idx = [0u8; 8];
+        idx.copy_from_slice(&bytes[16..24]);
+        u64::from_le_bytes(idx)
+    } else {
+        1
+    };
+    recover_log_from(bytes, first.max(1))
+}
+
+/// A point-in-time image of the state machine, plus where it sits in the log.
+///
+/// The `data` blob is opaque here: this module knows how to store a snapshot
+/// durably and how to tell a good one from a torn one, and nothing about what
+/// the application put inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Monotonic write counter, used to pick the newer of the two files.
+    pub seq: u64,
+    /// Last log index this image includes.
+    pub index: u64,
+    /// Term of the entry at `index`.
+    pub term: u64,
+    pub data: Vec<u8>,
+}
+
+impl Snapshot {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut payload = Enc::new();
+        payload.u64(self.seq).u64(self.index).u64(self.term);
+        payload.bytes(&self.data);
+        let payload = payload.into_vec();
+        let mut out = Vec::with_capacity(payload.len() + 8);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc32(&payload).to_le_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// Decode a snapshot file, returning `None` if it is absent or damaged.
+    pub fn decode(bytes: &[u8]) -> Option<Snapshot> {
+        if bytes.len() < 8 {
+            return None;
+        }
+        let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let crc = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if len == 0 || len > MAX_SNAPSHOT || 8 + len > bytes.len() {
+            return None;
+        }
+        let payload = &bytes[8..8 + len];
+        if crc32(payload) != crc {
+            return None;
+        }
+        let mut d = Dec::new(payload);
+        let seq = d.u64().ok()?;
+        let index = d.u64().ok()?;
+        let term = d.u64().ok()?;
+        let data = d.bytes().ok()?.to_vec();
+        Some(Snapshot {
+            seq,
+            index,
+            term,
+            data,
+        })
+    }
+}
+
+/// A snapshot larger than this is corruption, not data.
+const MAX_SNAPSHOT: usize = 64 << 20;
+
+/// Choose the better of the two snapshot files that is intact.
+///
+/// Ordered by covered index first and sequence number only as a tie-break. The
+/// sequence number records write order, and write order is not the same as
+/// recency of content: snapshots arrive over a network that reorders, so an
+/// older snapshot can quite easily be written after a newer one. Preferring the
+/// higher index keeps the better image; a torn write still fails to decode and
+/// falls through to the other file, which is what the two files are for.
+pub fn pick_snapshot(a: &[u8], b: &[u8]) -> Option<Snapshot> {
+    match (Snapshot::decode(a), Snapshot::decode(b)) {
+        (Some(x), Some(y)) => Some(if (x.index, x.seq) >= (y.index, y.seq) {
+            x
+        } else {
+            y
+        }),
+        (Some(x), None) => Some(x),
+        (None, y) => y,
     }
 }
 

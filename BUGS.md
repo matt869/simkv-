@@ -234,12 +234,62 @@ release builds.
 
 ---
 
+## 5. Three bugs in log compaction, found by building it
+
+Adding snapshots meant the recovery path — where every earlier bug lived — had
+to handle a log that no longer starts at index 1. Running with compaction turned
+up to absurd rates (`--snapshot-threshold 3`, a snapshot every three entries)
+found three defects in the new code within minutes.
+
+**A hole in the write-ahead file.** The file is append-only, and a node that
+installs a snapshot discards its whole log. It then appended the next entries
+*after* the records the snapshot had replaced, leaving a gap where the
+superseded entries used to be. Recovery reads the file as one contiguous run, so
+it stopped dead at the gap and never reached the entries beyond it — the node
+claimed 416 entries durable while its disk would produce 400. Fixed by resetting
+the log region when a snapshot supersedes it.
+
+**An older snapshot overwriting a newer one.** Two `InstallSnapshot` messages
+arrived out of order, so the snapshot covering index 12 was written *after* the
+one covering index 15 and got the higher sequence number. Recovery picks by
+sequence, so it chose the older image. Fixed twice over: snapshots are now
+ordered by covered index with the sequence number only as a tie-break, and a
+node refuses to write a snapshot older than one it has already written.
+
+**A state machine rolled back underneath its own applied index.** Installing a
+snapshot replaced the state machine even when the node had already applied
+*past* it. Raft went on believing everything through `last_applied` was
+reflected in the state, while the state had quietly reverted — which surfaced as
+a client reading a value that had been overwritten long before. The image is now
+only adopted when it is genuinely ahead of what has been applied.
+
+### Where this stopped: the retain-tail optimisation
+
+Raft section 7 permits keeping the log entries *above* an installed snapshot
+when the boundary entry matches, as an optimisation. With it enabled, a snapshot
+every five entries produced a linearizability violation (seed 425). Disabling it
+made that seed and all 500 in the sweep pass.
+
+It is disabled, and the reason is recorded rather than dressed up: **I did not
+establish why it was unsafe here.** Shipping an optimisation whose failure mode
+is not understood is worse than shipping without it. The cost is a leader
+re-sending entries it needn't have.
+
+One residual failure remains at `--snapshot-threshold 3` (seed 26, 1 in 500), a
+setting that snapshots more often than it commits. Thresholds from 5 upward are
+clean over 500 seeds each, and the default is 400. Recorded as open rather than
+tuned out of sight.
+
+---
+
 ## Current status
 
 ```
 6000 seeds across six configurations → no failures
-  (default; --max-batch 1; --max-batch 2; 5 servers + small batches;
-   5 servers, 8 clients, 2 keys; and majority-failure allowed)
+  (default; --max-batch 2; 5 servers; majority-failure allowed;
+   --snapshot-threshold 20; and 5 servers + threshold 10 + batch 2)
+2500 seeds across snapshot thresholds 5, 10, 50, 400 and off → no failures
+  (threshold 3 has one known failure, seed 26 — see bug 5)
 5000 seeds, 3-node cluster, crashes + partitions + clock skew + torn writes
   → 45.2M events, 2.4M operations checked, no failures
 

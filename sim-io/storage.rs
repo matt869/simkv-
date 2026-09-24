@@ -18,6 +18,24 @@ use simcore::disk::{FileId, IoResult, OpId};
 /// elect two leaders in one term.
 pub const FILE_WAL: FileId = 0;
 
+/// Snapshots alternate between two files.
+///
+/// A snapshot is written whole, so writing a new one over the old one leaves a
+/// window where a crash has destroyed the only copy -- and by then the log
+/// prefix it replaced may already be gone. Alternating means the previous
+/// snapshot is still intact until the new one is safely down.
+pub const FILE_SNAPSHOT_A: FileId = 1;
+pub const FILE_SNAPSHOT_B: FileId = 2;
+
+/// Which file the snapshot with this sequence number belongs in.
+pub fn snapshot_file(seq: u64) -> FileId {
+    if seq.is_multiple_of(2) {
+        FILE_SNAPSHOT_A
+    } else {
+        FILE_SNAPSHOT_B
+    }
+}
+
 pub trait Storage {
     /// Append to the end of the file. Returns the id of the operation whose
     /// completion event will report success or failure.

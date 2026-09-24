@@ -10,7 +10,10 @@
 //! Scope, stated honestly:
 //!
 //! * Fixed membership. Joint-consensus reconfiguration is not implemented.
-//! * No snapshots or log compaction; the log grows for the length of a run.
+//! * Log compaction is implemented, with snapshots transferred to followers
+//!   that have fallen behind. Disk space is not reclaimed: the write-ahead file
+//!   is append-only, because compacting it in place would need an atomic
+//!   rename, and the storage model deliberately does not offer one.
 //! * Reads go through the log, which is the simple way to be linearizable.
 //!   Lease-based or read-index reads would be faster and much easier to get
 //!   subtly wrong.

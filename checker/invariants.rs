@@ -40,6 +40,10 @@ pub struct NodeView<'a> {
     pub incarnation: u64,
     /// Count of log truncations this node has performed.
     pub truncations: u64,
+    /// Last index the node's snapshot covers. Entries at or below it are no
+    /// longer in the log, which is not the same as being absent from history:
+    /// a check that cannot see an entry there must skip it, not fail.
+    pub snapshot_index: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -288,6 +292,12 @@ impl Invariants {
                     checked_to = *index;
                     continue;
                 }
+                if *index <= v.snapshot_index {
+                    // Inside this leader's snapshot: it holds the entry, just
+                    // not as a log entry any more.
+                    checked_to = *index;
+                    continue;
+                }
                 if *index > v.log.last_index() {
                     out.push(Violation::new(
                         "leader_completeness",
@@ -352,6 +362,7 @@ impl Invariants {
         // checking cost more than simulating. The watermark is reset whenever
         // the node truncates or restarts, which are the only ways an entry
         // already looked at can change.
+        let committed_from = committed_from.max(v.snapshot_index + 1);
         let mut committed_checked = committed_from.saturating_sub(1);
         for index in committed_from..=v.commit_index {
             let Some(entry) = v.log.get(index) else {
@@ -386,6 +397,7 @@ impl Invariants {
         }
 
         // --- state machine safety --------------------------------------
+        let applied_from = applied_from.max(v.snapshot_index + 1);
         let mut applied_checked = applied_from.saturating_sub(1);
         for index in applied_from..=v.last_applied {
             let Some(entry) = v.log.get(index) else {
@@ -471,6 +483,7 @@ mod tests {
             durable_index: log.last_index(),
             incarnation: 0,
             truncations: 0,
+            snapshot_index: 0,
         }
     }
 

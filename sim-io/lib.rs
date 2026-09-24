@@ -17,7 +17,9 @@ pub mod storage;
 
 pub use clock::{Clock, Deadline, TimerHandle, TimerTag};
 pub use network::{peers, quorum, Net};
-pub use storage::{Completion, PendingOps, Storage, FILE_WAL};
+pub use storage::{
+    snapshot_file, Completion, PendingOps, Storage, FILE_SNAPSHOT_A, FILE_SNAPSHOT_B, FILE_WAL,
+};
 
 use simcore::disk::{FileId, OpId};
 use simcore::trace::Level;

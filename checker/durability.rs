@@ -14,14 +14,29 @@
 //! would sail past every in-memory invariant and fail here.
 
 use crate::Violation;
-use kvstore::log::{recover_hard_state, recover_log, Command, Entry};
+use kvstore::log::{pick_snapshot, recover_hard_state, recover_log_any_start, Command, Entry};
 use kvstore::raft::LOG_REGION;
 use simcore::{Nanos, NodeId};
 
-/// The durable image of one node's write-ahead file.
+/// The durable image of one node's files.
 pub struct DiskView {
     pub id: NodeId,
+    /// The write-ahead file.
     pub bytes: Vec<u8>,
+    /// The two snapshot files, either of which may be absent or torn.
+    pub snapshots: (Vec<u8>, Vec<u8>),
+}
+
+impl DiskView {
+    /// A view with no snapshot files, for tests and for callers that only care
+    /// about the log.
+    pub fn wal_only(id: NodeId, bytes: Vec<u8>) -> DiskView {
+        DiskView {
+            id,
+            bytes,
+            snapshots: (Vec::new(), Vec::new()),
+        }
+    }
 }
 
 /// What a node would recover if it restarted right now.
@@ -30,6 +45,9 @@ pub struct Recovered {
     pub term: u64,
     pub voted_for: Option<NodeId>,
     pub entries: Vec<Entry>,
+    /// Last index the durable snapshot covers, if there is one.
+    pub snapshot_index: u64,
+    pub snapshot_term: u64,
 }
 
 impl Recovered {
@@ -41,25 +59,45 @@ impl Recovered {
         if index == 0 {
             return None;
         }
-        self.entries.get((index - 1) as usize)
+        self.entries.iter().find(|e| e.index == index)
+    }
+
+    /// Whether this node would still have `index` after a power cut, whether
+    /// as a log entry or folded into its snapshot.
+    pub fn holds(&self, index: u64) -> bool {
+        index <= self.snapshot_index || self.get(index).is_some()
+    }
+
+    /// Highest index this node would recover, snapshot included.
+    pub fn highest(&self) -> u64 {
+        self.last_index().max(self.snapshot_index)
     }
 }
 
 /// Decode a durable image exactly as [`kvstore::raft::Raft::recover`] would,
 /// including dropping entries whose term was never made durable.
 pub fn recover(bytes: &[u8]) -> Recovered {
+    recover_with_snapshots(bytes, &[], &[])
+}
+
+/// Decode a node's durable state: its snapshot, and the log above it.
+pub fn recover_with_snapshots(bytes: &[u8], snap_a: &[u8], snap_b: &[u8]) -> Recovered {
     let hs = recover_hard_state(bytes);
+    let snap = pick_snapshot(snap_a, snap_b);
+    let (snapshot_index, snapshot_term) = snap.map_or((0, 0), |s| (s.index, s.term));
     let log_bytes = if bytes.len() > LOG_REGION {
         &bytes[LOG_REGION..]
     } else {
         &[][..]
     };
-    let mut entries = recover_log(log_bytes).entries;
+    let mut entries = recover_log_any_start(log_bytes).entries;
     entries.retain(|e| e.term <= hs.term);
     Recovered {
         term: hs.term,
         voted_for: hs.voted_for,
         entries,
+        snapshot_index,
+        snapshot_term,
     }
 }
 
@@ -80,8 +118,15 @@ pub fn check_committed_durable(
 ) -> Vec<Violation> {
     let mut out = Vec::new();
     let quorum = cluster_size / 2 + 1;
-    let recovered: Vec<(NodeId, Recovered)> =
-        disks.iter().map(|d| (d.id, recover(&d.bytes))).collect();
+    let recovered: Vec<(NodeId, Recovered)> = disks
+        .iter()
+        .map(|d| {
+            (
+                d.id,
+                recover_with_snapshots(&d.bytes, &d.snapshots.0, &d.snapshots.1),
+            )
+        })
+        .collect();
 
     for c in committed {
         // Only an exact match counts. A node whose disk holds something *else*
@@ -93,8 +138,13 @@ pub fn check_committed_durable(
         let holders = recovered
             .iter()
             .filter(|(_, r)| {
-                r.get(c.index)
-                    .is_some_and(|e| e.term == c.term && e.cmd == c.cmd)
+                // Inside a snapshot the entry is held but its command is no
+                // longer separately visible: the snapshot was built from the
+                // state those entries produced, so covering the index is the
+                // evidence.
+                c.index <= r.snapshot_index
+                    || r.get(c.index)
+                        .is_some_and(|e| e.term == c.term && e.cmd == c.cmd)
             })
             .count();
         if holders < quorum {
@@ -135,22 +185,29 @@ pub fn check_recovery(
     before: &[Entry],
     durable_index: u64,
     after: &[Entry],
+    snapshot_after: u64,
 ) -> Vec<Violation> {
     let mut out = Vec::new();
-    let promised = durable_index.min(before.len() as u64);
-    if (after.len() as u64) < promised {
-        out.push(Violation::new(
-            "durable_entry_lost",
-            time,
-            Some(node),
-            format!(
-                "recovered only {} entries, but {promised} had been synced before the crash",
-                after.len()
-            ),
-        ));
-        return out;
-    }
-    for (was, now) in before.iter().zip(after).take(promised as usize) {
+    let promised = durable_index.min(before.last().map_or(0, |e| e.index));
+    // An entry the node has since folded into a snapshot is still held, just
+    // not as a log entry, so only the range still expected to be in the log is
+    // compared.
+    for was in before
+        .iter()
+        .filter(|e| e.index <= promised && e.index > snapshot_after)
+    {
+        let Some(now) = after.iter().find(|e| e.index == was.index) else {
+            out.push(Violation::new(
+                "durable_entry_lost",
+                time,
+                Some(node),
+                format!(
+                    "index {} had been synced before the crash but did not come back",
+                    was.index
+                ),
+            ));
+            break;
+        };
         if now != was {
             out.push(Violation::new(
                 "durable_entry_changed",
@@ -188,19 +245,36 @@ pub fn check_durable_claim(
     if durable_index == 0 {
         return Vec::new();
     }
-    let r = recover(&disk.bytes);
-    if r.last_index() < durable_index {
+    let r = recover_with_snapshots(&disk.bytes, &disk.snapshots.0, &disk.snapshots.1);
+    if r.highest() < durable_index {
         return vec![Violation::new(
             "durable_claim_unbacked",
             time,
             Some(node),
             format!(
                 "claims {durable_index} entries are durable, but the disk would recover only {}",
-                r.last_index()
+                r.highest()
             ),
         )];
     }
-    for (in_memory, on_disk) in log.iter().zip(&r.entries).take(durable_index as usize) {
+    // Matched by log index rather than by position: after a compaction the
+    // in-memory log starts above index 1 while the append-only file still
+    // begins at the beginning, so the two are no longer aligned.
+    for in_memory in log
+        .iter()
+        .filter(|e| e.index <= durable_index && e.index > r.snapshot_index)
+    {
+        let Some(on_disk) = r.get(in_memory.index) else {
+            return vec![Violation::new(
+                "durable_claim_unbacked",
+                time,
+                Some(node),
+                format!(
+                    "claims index {} is durable, but the disk does not have it",
+                    in_memory.index
+                ),
+            )];
+        };
         if on_disk != in_memory {
             return vec![Violation::new(
                 "durable_claim_unbacked",
@@ -224,7 +298,7 @@ pub fn check_term_durable(
     acted_term: u64,
     disk: &DiskView,
 ) -> Vec<Violation> {
-    let r = recover(&disk.bytes);
+    let r = recover_with_snapshots(&disk.bytes, &disk.snapshots.0, &disk.snapshots.1);
     if r.term < acted_term {
         return vec![Violation::new(
             "durable_term_lost",
@@ -316,10 +390,7 @@ mod tests {
     }
 
     fn disk(id: u32, term: u64, entries: &[Entry]) -> DiskView {
-        DiskView {
-            id: NodeId(id),
-            bytes: image(term, entries),
-        }
+        DiskView::wal_only(NodeId(id), image(term, entries))
     }
 
     fn committed(entries: &[Entry]) -> Vec<CommittedEntry> {
@@ -407,13 +478,13 @@ mod tests {
     fn losing_the_unsynced_tail_is_legal_recovery() {
         let before = vec![entry(1, 1), entry(2, 1), entry(3, 1)];
         // Only the first entry was synced, so only it has to come back.
-        assert!(check_recovery(0, NodeId(0), &before, 1, &before[..1]).is_empty());
+        assert!(check_recovery(0, NodeId(0), &before, 1, &before[..1], 0).is_empty());
     }
 
     #[test]
     fn losing_a_synced_entry_is_caught() {
         let before = vec![entry(1, 1), entry(2, 1), entry(3, 1)];
-        let v = check_recovery(0, NodeId(0), &before, 3, &before[..2]);
+        let v = check_recovery(0, NodeId(0), &before, 3, &before[..2], 0);
         assert_eq!(v[0].kind, "durable_entry_lost");
     }
 
@@ -428,7 +499,7 @@ mod tests {
                 cmd: cmd(2),
             },
         ];
-        let v = check_recovery(0, NodeId(0), &before, 2, &after);
+        let v = check_recovery(0, NodeId(0), &before, 2, &after, 0);
         assert_eq!(v[0].kind, "durable_entry_changed");
     }
 
@@ -439,7 +510,7 @@ mod tests {
         // and harmless: not a violation.
         let before = vec![entry(1, 1)];
         let after = vec![entry(1, 1), entry(2, 1), entry(3, 1)];
-        assert!(check_recovery(0, NodeId(0), &before, 1, &after).is_empty());
+        assert!(check_recovery(0, NodeId(0), &before, 1, &after, 0).is_empty());
     }
 
     #[test]

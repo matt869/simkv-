@@ -14,18 +14,25 @@
 //! * A write error is fatal. A node that cannot persist cannot participate,
 //!   so it stops rather than answering from memory it may lose.
 //!
-//! Not implemented, deliberately: snapshots, log compaction, membership
-//! changes, and lease-based reads. See the crate docs.
+//! Log compaction is implemented: once enough entries pile up above the last
+//! snapshot, the state machine is written whole to one of two alternating
+//! snapshot files and the entries it covers are dropped from memory. A follower
+//! that has fallen behind the compacted log is caught up with `InstallSnapshot`
+//! rather than entries. The write-ahead file itself stays append-only -- see
+//! `recover_log_any_start` for why.
+//!
+//! Not implemented, deliberately: membership changes and lease-based reads.
+//! See the crate docs.
 
 use crate::codec::{Dec, DecodeError, Enc};
 use crate::log::{
-    recover_hard_state, recover_log, Command, Entry, HardState, RaftLog, NO_INDEX, SLOT_SIZE,
-    STATE_FILE_SIZE,
+    pick_snapshot, recover_hard_state, recover_log_any_start, Command, Entry, HardState, RaftLog,
+    Snapshot, NO_INDEX, SLOT_SIZE, STATE_FILE_SIZE,
 };
 use crate::Message;
-use sim_io::storage::FILE_WAL;
+use sim_io::storage::{snapshot_file, FILE_SNAPSHOT_A, FILE_SNAPSHOT_B, FILE_WAL};
 use sim_io::{Deadline, Io, PendingOps, TimerTag};
-use simcore::disk::OpId;
+use simcore::disk::{FileId, OpId};
 use simcore::rng::Rng;
 use simcore::trace::Level;
 use simcore::{Nanos, NodeId, MILLIS};
@@ -141,6 +148,9 @@ pub struct RaftConfig {
     pub heartbeat_interval: Nanos,
     /// Maximum entries per AppendEntries.
     pub max_batch: usize,
+    /// Take a snapshot once this many entries sit above the last one. Zero
+    /// disables compaction entirely.
+    pub snapshot_threshold: u64,
     /// A deliberate defect, for verifying that the checkers work.
     pub bug: InjectedBug,
 }
@@ -151,6 +161,7 @@ impl Default for RaftConfig {
             election_timeout: (300 * MILLIS, 600 * MILLIS),
             heartbeat_interval: 50 * MILLIS,
             max_batch: 64,
+            snapshot_threshold: 400,
             bug: InjectedBug::None,
         }
     }
@@ -184,6 +195,22 @@ pub enum RaftMsg {
         /// Where the leader should back up to on failure.
         conflict_index: u64,
     },
+    /// Sent when a follower has fallen behind the leader's compacted log, so
+    /// there are no entries left to send it. Transferred whole: chunking would
+    /// add a second partial-transfer state machine for no extra coverage of the
+    /// properties under test.
+    InstallSnapshot {
+        term: u64,
+        leader: NodeId,
+        index: u64,
+        index_term: u64,
+        data: Vec<u8>,
+    },
+    InstallSnapshotResp {
+        term: u64,
+        /// The index the follower now holds, once the snapshot is durable.
+        index: u64,
+    },
 }
 
 impl RaftMsg {
@@ -192,7 +219,9 @@ impl RaftMsg {
             RaftMsg::RequestVote { term, .. }
             | RaftMsg::RequestVoteResp { term, .. }
             | RaftMsg::AppendEntries { term, .. }
-            | RaftMsg::AppendEntriesResp { term, .. } => *term,
+            | RaftMsg::AppendEntriesResp { term, .. }
+            | RaftMsg::InstallSnapshot { term, .. }
+            | RaftMsg::InstallSnapshotResp { term, .. } => *term,
         }
     }
 
@@ -244,6 +273,23 @@ impl RaftMsg {
                     .u64(*match_index)
                     .u64(*conflict_index);
             }
+            RaftMsg::InstallSnapshot {
+                term,
+                leader,
+                index,
+                index_term,
+                data,
+            } => {
+                e.u8(5)
+                    .u64(*term)
+                    .u32(leader.0)
+                    .u64(*index)
+                    .u64(*index_term)
+                    .bytes(data);
+            }
+            RaftMsg::InstallSnapshotResp { term, index } => {
+                e.u8(6).u64(*term).u64(*index);
+            }
         }
     }
 
@@ -290,6 +336,17 @@ impl RaftMsg {
                 match_index: d.u64()?,
                 conflict_index: d.u64()?,
             },
+            5 => RaftMsg::InstallSnapshot {
+                term: d.u64()?,
+                leader: NodeId(d.u32()?),
+                index: d.u64()?,
+                index_term: d.u64()?,
+                data: d.bytes()?.to_vec(),
+            },
+            6 => RaftMsg::InstallSnapshotResp {
+                term: d.u64()?,
+                index: d.u64()?,
+            },
             t => return Err(DecodeError::BadTag(t)),
         })
     }
@@ -322,6 +379,15 @@ enum Persist {
     },
     /// Hard state is durable; the message may now be sent.
     Reply { to: NodeId, msg: RaftMsg },
+    /// A snapshot this node took is durable: the log may now be compacted.
+    SnapshotTaken { index: u64, term: u64 },
+    /// A snapshot received from the leader is durable: adopt it and answer.
+    SnapshotInstalled {
+        index: u64,
+        term: u64,
+        reply_to: NodeId,
+        reply_term: u64,
+    },
     /// Hard state is durable; nothing to say about it.
     Quiet,
 }
@@ -346,6 +412,9 @@ enum OpKind {
 #[derive(Clone, Debug)]
 struct Batch {
     id: u64,
+    /// Which file this batch is syncing. Snapshots live in their own files, so
+    /// a batch cannot assume the write-ahead file.
+    file: FileId,
     writes_outstanding: usize,
     sync_issued: bool,
     action: Persist,
@@ -370,7 +439,7 @@ struct Persister {
 #[derive(Debug, PartialEq, Eq)]
 enum BatchEvent {
     Nothing,
-    NeedSync(u64),
+    NeedSync(u64, FileId),
     Done {
         action: Persist,
         hard_term: Option<u64>,
@@ -383,6 +452,7 @@ impl Persister {
         self.next_id += 1;
         self.batches.push(Batch {
             id: self.next_id,
+            file: FILE_WAL,
             writes_outstanding: 0,
             sync_issued: false,
             action,
@@ -400,6 +470,13 @@ impl Persister {
             b.writes_outstanding += 1;
         }
         self.ops.insert(op, (id, OpKind::Write));
+    }
+
+    /// Point this batch at a file other than the write-ahead file.
+    fn note_file(&mut self, id: u64, file: FileId) {
+        if let Some(b) = self.batch(id) {
+            b.file = file;
+        }
     }
 
     /// Record that this batch writes the hard state carrying `term`.
@@ -431,7 +508,7 @@ impl Persister {
                 };
                 b.writes_outstanding -= 1;
                 if b.writes_outstanding == 0 && !b.sync_issued {
-                    BatchEvent::NeedSync(id)
+                    BatchEvent::NeedSync(id, b.file)
                 } else {
                     BatchEvent::Nothing
                 }
@@ -472,6 +549,9 @@ pub struct RaftStats {
     /// Truncations that cut at or below this node's own commit index. Must
     /// stay zero; counted rather than asserted so release builds report it.
     pub truncated_committed: u64,
+    pub snapshots_taken: u64,
+    pub snapshots_installed: u64,
+    pub snapshots_sent: u64,
 }
 
 pub struct Raft {
@@ -499,6 +579,24 @@ pub struct Raft {
     parked: Vec<(u64, u64)>,
     /// Sequence number for the next hard-state slot write.
     state_seq: u64,
+    /// Sequence number for the next snapshot write, which also decides which
+    /// of the two snapshot files it goes to.
+    snapshot_seq: u64,
+    /// A snapshot that has been received and made durable, waiting for the
+    /// state machine above to adopt it.
+    pending_restore: Option<Vec<u8>>,
+    /// Whether a snapshot write is already in flight, so one is not started
+    /// again on every applied entry.
+    snapshot_in_flight: bool,
+    /// A snapshot being installed from the leader, held until it is durable.
+    pending_snapshot_data: Option<(u64, Vec<u8>)>,
+    /// The most recent snapshot, kept in memory so a follower that has fallen
+    /// behind the compacted log can be sent one without reading it back.
+    snapshot_data: Vec<u8>,
+    /// Highest index any snapshot write has covered, whether or not it has
+    /// landed yet. Stops an older snapshot being written over a newer one when
+    /// the network delivers them out of order.
+    highest_snapshot: u64,
     /// Highest term known to be on stable storage.
     ///
     /// No message carrying a term above this may leave the node: announcing a
@@ -529,31 +627,78 @@ impl Raft {
         );
         let bytes = io.read_all(FILE_WAL);
         let hs = recover_hard_state(&bytes);
+
+        // The snapshot comes first: it decides where the log begins.
+        let snap = pick_snapshot(&io.read_all(FILE_SNAPSHOT_A), &io.read_all(FILE_SNAPSHOT_B));
+        let (snap_index, snap_term, snapshot_seq, restore_blob) = match snap {
+            Some(s) => (s.index, s.term, s.seq, Some(s.data)),
+            None => (0, 0, 0, None),
+        };
+        let snapshot_bytes = restore_blob.clone().unwrap_or_default();
+
         let log_bytes = if bytes.len() > LOG_REGION {
             &bytes[LOG_REGION..]
         } else {
             &[][..]
         };
-        let recovered = recover_log(log_bytes);
+        // The file may still begin with entries the snapshot has absorbed, so
+        // read from wherever it actually starts.
+        let recovered = recover_log_any_start(log_bytes);
         let records_read = recovered.entries.len();
         let valid_bytes = recovered.valid_bytes;
-        let mut entries = recovered.entries;
 
         // Entries whose term exceeds the durable term were never acknowledged:
         // acknowledging one would have required the sync that also made the
         // term durable. Dropping them keeps "durable log implies durable term",
         // which is what stops two leaders sharing a term after a crash.
-        let dropped_ahead_of_term = entries.iter().filter(|e| e.term > hs.term).count();
-        entries.retain(|e| e.term <= hs.term);
+        let dropped_ahead_of_term = recovered
+            .entries
+            .iter()
+            .filter(|e| e.term > hs.term)
+            .count();
 
-        let log = RaftLog::from_entries(entries);
-        let damaged = recovered.damaged || dropped_ahead_of_term > 0;
-        if damaged {
-            // Cut the file back to the prefix we trust, so later appends do not
-            // land after garbage.
-            io.set_len(FILE_WAL, LOG_REGION + log.byte_len());
-            io.sync(FILE_WAL);
+        let mut entries = Vec::new();
+        let mut offsets = Vec::new();
+        let mut end = recovered.valid_bytes;
+        let mut spliced = false;
+        for (e, off) in recovered.entries.into_iter().zip(recovered.offsets) {
+            if e.term > hs.term {
+                continue;
+            }
+            if e.index <= snap_index {
+                // Already inside the snapshot.
+                continue;
+            }
+            let expected = entries
+                .last()
+                .map_or(snap_index + 1, |p: &Entry| p.index + 1);
+            if e.index != expected {
+                // A gap between the snapshot and the file: everything after it
+                // is unusable, and the leader will resend.
+                spliced = true;
+                end = off;
+                break;
+            }
+            entries.push(e);
+            offsets.push(off);
         }
+        if let Some(last) = entries.last() {
+            end = offsets[entries.len() - 1] + last.to_record().len();
+        } else if snap_index > 0 {
+            end = recovered.valid_bytes;
+        }
+
+        // With nothing left above the snapshot, the log region is dead weight:
+        // reset it so the next append starts at the beginning rather than after
+        // records the snapshot has replaced, which would leave a gap recovery
+        // could never read past.
+        let stale_region = entries.is_empty() && recovered.valid_bytes > 0;
+        if stale_region {
+            end = 0;
+        }
+
+        let log = RaftLog::from_parts(snap_index, snap_term, entries, offsets, end);
+        let damaged = recovered.damaged || dropped_ahead_of_term > 0 || spliced || stale_region;
 
         let durable_index = log.last_index();
         let mut raft = Raft {
@@ -564,14 +709,22 @@ impl Raft {
             term: hs.term,
             voted_for: hs.voted_for,
             log,
-            commit_index: NO_INDEX,
-            last_applied: NO_INDEX,
+            // Everything the snapshot covers is, by construction, committed and
+            // applied: it was built from applied state.
+            commit_index: snap_index,
+            last_applied: snap_index,
             leader: None,
             votes: BTreeSet::new(),
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
             durable_index,
             parked: Vec::new(),
+            snapshot_seq: snapshot_seq + 1,
+            pending_restore: restore_blob,
+            snapshot_in_flight: false,
+            pending_snapshot_data: None,
+            snapshot_data: snapshot_bytes,
+            highest_snapshot: snap_index,
             state_seq: hs.seq + 1,
             durable_term: hs.term,
             persister: Persister::default(),
@@ -586,13 +739,16 @@ impl Raft {
             Level::Info,
             "raft",
             format!(
-                "recovered term={} vote={:?} log={} durable={} damaged={} \
-                 (file={}B, log region={}B, {} records read, {} valid bytes, \
+                "recovered term={} vote={:?} log={}..{} durable={} snapshot={}@{} \
+                 damaged={} (file={}B, log region={}B, {} records read, {} valid bytes, \
                  {} dropped ahead of term)",
                 raft.term,
                 raft.voted_for.map(|n| n.0),
+                raft.log.first_index(),
                 raft.log.last_index(),
                 durable_index,
+                snap_index,
+                snap_term,
                 damaged,
                 bytes.len(),
                 log_bytes.len(),
@@ -700,6 +856,16 @@ impl Raft {
                 match_index,
                 conflict_index,
             } => self.on_append_resp(io, from, term, success, match_index, conflict_index),
+            RaftMsg::InstallSnapshot {
+                term,
+                leader,
+                index,
+                index_term,
+                data,
+            } => self.on_install_snapshot(io, from, term, leader, index, index_term, data),
+            RaftMsg::InstallSnapshotResp { term, index } => {
+                self.on_install_snapshot_resp(io, from, term, index)
+            }
         }
     }
 
@@ -746,8 +912,8 @@ impl Raft {
                 );
                 io.observe("io_failed", &[]);
             }
-            BatchEvent::NeedSync(id) => {
-                let sync_op = io.sync(FILE_WAL);
+            BatchEvent::NeedSync(id, file) => {
+                let sync_op = io.sync(file);
                 self.persister.note_sync(id, sync_op);
             }
             BatchEvent::Done { action, hard_term } => {
@@ -787,6 +953,7 @@ impl Raft {
     /// machine.
     pub fn take_applied(&mut self) -> Vec<Entry> {
         let mut out = Vec::new();
+        self.last_applied = self.last_applied.max(self.log.snapshot_index());
         while self.last_applied < self.commit_index {
             let next = self.last_applied + 1;
             match self.log.get(next) {
@@ -1019,6 +1186,36 @@ impl Raft {
         self.leader = Some(leader);
         self.reset_election_timer(io);
 
+        let last_new_index = prev_index + entries.len() as u64;
+
+        // Everything at or below the snapshot is already applied here, so an
+        // append reaching back before it is stale by definition. Skip the part
+        // the snapshot covers rather than reject the whole message, which would
+        // leave the leader backing up towards entries that no longer exist.
+        let (prev_index, prev_term, entries) = if prev_index < self.log.snapshot_index() {
+            let skip = (self.log.snapshot_index() - prev_index) as usize;
+            if entries.len() <= skip {
+                self.send(
+                    io,
+                    from,
+                    RaftMsg::AppendEntriesResp {
+                        term: self.term,
+                        success: true,
+                        match_index: self.durable_index.min(last_new_index),
+                        conflict_index: NO_INDEX,
+                    },
+                );
+                return;
+            }
+            (
+                self.log.snapshot_index(),
+                self.log.snapshot_term(),
+                entries[skip..].to_vec(),
+            )
+        } else {
+            (prev_index, prev_term, entries)
+        };
+
         if !self.log.matches(prev_index, prev_term) {
             let conflict = self.conflict_hint(prev_index);
             let reply = RaftMsg::AppendEntriesResp {
@@ -1075,7 +1272,6 @@ impl Raft {
             }
         }
 
-        let last_new_index = prev_index + entries.len() as u64;
         if self.cfg.bug == InjectedBug::TruncateOnAnyAppend
             && self.log.last_index() > last_new_index
             && last_new_index >= prev_index
@@ -1296,8 +1492,25 @@ impl Raft {
     fn send_append_to(&mut self, io: &mut dyn Io, to: NodeId) {
         let next = self.next_index.get(&to).copied().unwrap_or(1).max(1);
         let prev_index = next - 1;
+
+        // The entries this follower needs have been compacted away, so the
+        // only way to catch it up is to send the snapshot that replaced them.
+        if prev_index < self.log.snapshot_index() && !self.snapshot_data.is_empty() {
+            let msg = RaftMsg::InstallSnapshot {
+                term: self.term,
+                leader: self.id,
+                index: self.log.snapshot_index(),
+                index_term: self.log.snapshot_term(),
+                data: self.snapshot_data.clone(),
+            };
+            self.stats.snapshots_sent += 1;
+            self.send(io, to, msg);
+            return;
+        }
+
         let Some(prev_term) = self.log.term_at(prev_index) else {
-            // Only reachable with log compaction, which this build does not do.
+            // Below the snapshot boundary with no snapshot to send: nothing
+            // useful can be said to this follower until one exists.
             return;
         };
         let entries = self.log.slice_from(next, self.cfg.max_batch);
@@ -1437,11 +1650,282 @@ impl Raft {
                     self.maybe_commit(io);
                 }
             }
+            Persist::SnapshotTaken { index, term } => {
+                self.snapshot_in_flight = false;
+                // Only now, with the snapshot on stable storage, may the
+                // entries it replaces be dropped.
+                self.log.compact_to(index, term);
+                io.observe("compact", &[index]);
+                io.trace(
+                    Level::Info,
+                    "raft",
+                    format!(
+                        "compacted log to start at {} ({} entries remain)",
+                        self.log.first_index(),
+                        self.log.len()
+                    ),
+                );
+            }
+            Persist::SnapshotInstalled {
+                index,
+                term,
+                reply_to,
+                reply_term,
+            } => {
+                // Raft section 7 allows keeping the entries above a snapshot
+                // when the boundary entry matches, as an optimisation. It is
+                // deliberately not taken here: with it, a snapshot every five
+                // entries produced a linearizability violation that disabling
+                // it made go away across 500 seeds, and shipping an
+                // optimisation whose failure is not understood is worse than
+                // shipping without it. The cost is that the leader re-sends
+                // entries it need not have; the benefit is that an installed
+                // snapshot means exactly one thing.
+                let keeps_tail = false;
+                if index < self.commit_index {
+                    // This node committed past the snapshot while the write was
+                    // in flight. Adopting it now would replace a log containing
+                    // committed entries with one that ends below the commit
+                    // index. The snapshot is simply stale; answer with where
+                    // this node actually is and leave the log alone.
+                    self.pending_snapshot_data = None;
+                    self.send(
+                        io,
+                        reply_to,
+                        RaftMsg::InstallSnapshotResp {
+                            term: reply_term,
+                            index: self.durable_index,
+                        },
+                    );
+                    return;
+                }
+                // Only hand the image up to the state machine if it is actually
+                // ahead of what has already been applied.
+                //
+                // Replacing a state machine with an *older* image while leaving
+                // last_applied where it is leaves the two silently out of step:
+                // Raft believes everything through last_applied is reflected in
+                // the state machine, the state machine has quietly rolled back
+                // to the snapshot, and the difference shows up as a client
+                // reading a value that was overwritten long ago.
+                let restore = index > self.last_applied;
+                match self.pending_snapshot_data.take() {
+                    Some((pending_index, data)) if pending_index == index => {
+                        self.snapshot_data = data.clone();
+                        if restore {
+                            self.pending_restore = Some(data);
+                        }
+                    }
+                    _ => {}
+                }
+                // If this node already holds the snapshot's last entry with the
+                // same term, everything after it is still valid and is kept --
+                // discarding it would throw away entries that may already be
+                // committed, and drive the commit index past the end of the log.
+                if keeps_tail {
+                    self.log.compact_to(index, term);
+                } else {
+                    // The snapshot supersedes the whole local log, so the log
+                    // region is reset with it. Appending after the old records
+                    // instead would leave a hole where the superseded entries
+                    // used to be, and recovery -- which reads the file as one
+                    // contiguous run -- would stop dead at the gap and never
+                    // reach the entries beyond it.
+                    self.log = RaftLog::from_snapshot(index, term, Vec::new());
+                    io.set_len(FILE_WAL, LOG_REGION);
+                    io.sync(FILE_WAL);
+                }
+                self.parked.clear();
+                self.durable_index = self.durable_index.max(index).min(self.log.last_index());
+                self.commit_index = self.commit_index.max(index);
+                if restore {
+                    // The state machine is now exactly the snapshot, so this is
+                    // precisely how much has been applied -- no more, no less.
+                    self.last_applied = index;
+                }
+                io.observe("restored", &[index, term]);
+                self.send(
+                    io,
+                    reply_to,
+                    RaftMsg::InstallSnapshotResp {
+                        term: reply_term,
+                        index,
+                    },
+                );
+            }
             Persist::Quiet => {}
         }
     }
 
     // ---- plumbing ---------------------------------------------------------
+
+    /// Whether the log has grown far enough above the snapshot to take a new
+    /// one.
+    pub fn wants_snapshot(&self) -> bool {
+        self.cfg.snapshot_threshold > 0
+            && !self.snapshot_in_flight
+            && !self.failed
+            && self.last_applied > self.log.snapshot_index()
+            && self.last_applied - self.log.snapshot_index() >= self.cfg.snapshot_threshold
+    }
+
+    /// The index a new snapshot would cover.
+    pub fn snapshot_point(&self) -> u64 {
+        self.last_applied
+    }
+
+    /// Persist a snapshot of the state machine covering everything applied so
+    /// far, and compact the log once it is durable.
+    ///
+    /// The ordering is the whole point: the log prefix is only dropped after
+    /// the snapshot that replaces it is on stable storage, and the snapshot
+    /// goes to the file the *other* one is not in, so a crash mid-write leaves
+    /// the previous snapshot intact.
+    pub fn take_snapshot(&mut self, io: &mut dyn Io, data: Vec<u8>) {
+        if !self.wants_snapshot() {
+            return;
+        }
+        let index = self.last_applied;
+        let Some(term) = self.log.term_at(index) else {
+            return;
+        };
+        let seq = self.snapshot_seq;
+        self.snapshot_seq += 1;
+        self.highest_snapshot = self.highest_snapshot.max(index);
+        self.snapshot_in_flight = true;
+        let file = snapshot_file(seq);
+        let snap = Snapshot {
+            seq,
+            index,
+            term,
+            data,
+        };
+        let encoded = snap.encode();
+        self.snapshot_data = snap.data.clone();
+        io.trace(
+            Level::Info,
+            "raft",
+            format!(
+                "snapshotting through index {index} (term {term}, {} bytes) into file {file}",
+                encoded.len()
+            ),
+        );
+        io.observe("snapshot", &[index, term]);
+        let batch = self.persister.start(Persist::SnapshotTaken { index, term });
+        // Truncate first so a shorter snapshot cannot leave a longer one's tail
+        // behind it, which would decode as garbage rather than as absent.
+        let op = io.set_len(file, 0);
+        self.persister.note_write(batch, op);
+        let op = io.write_at(file, 0, &encoded);
+        self.persister.note_write(batch, op);
+        self.persister.note_file(batch, file);
+        self.stats.snapshots_taken += 1;
+    }
+
+    /// A snapshot received from the leader, waiting to be adopted by the state
+    /// machine above.
+    pub fn take_pending_restore(&mut self) -> Option<Vec<u8>> {
+        self.pending_restore.take()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_install_snapshot(
+        &mut self,
+        io: &mut dyn Io,
+        from: NodeId,
+        term: u64,
+        leader: NodeId,
+        index: u64,
+        index_term: u64,
+        data: Vec<u8>,
+    ) {
+        if term < self.term {
+            self.send(
+                io,
+                from,
+                RaftMsg::InstallSnapshotResp {
+                    term: self.term,
+                    index: NO_INDEX,
+                },
+            );
+            return;
+        }
+        if term > self.term {
+            self.step_down(io, term);
+        }
+        if self.role != Role::Follower {
+            self.role = Role::Follower;
+            self.votes.clear();
+            self.heartbeat_timer.disarm(io);
+        }
+        self.leader = Some(leader);
+        self.reset_election_timer(io);
+
+        // Nothing to install if this node is already at or past the snapshot.
+        // The commit index matters as much as the applied one: a snapshot that
+        // stops short of what this node has already committed would, if
+        // adopted, drop committed entries and drive the commit index backwards
+        // past the end of its own log.
+        if index <= self.highest_snapshot || index <= self.commit_index {
+            self.send(
+                io,
+                from,
+                RaftMsg::InstallSnapshotResp {
+                    term: self.term,
+                    index: self.log.last_index().min(self.last_applied),
+                },
+            );
+            return;
+        }
+
+        let seq = self.snapshot_seq;
+        self.snapshot_seq += 1;
+        self.highest_snapshot = self.highest_snapshot.max(index);
+        let file = snapshot_file(seq);
+        let snap = Snapshot {
+            seq,
+            index,
+            term: index_term,
+            data,
+        };
+        let encoded = snap.encode();
+        io.trace(
+            Level::Info,
+            "raft",
+            format!("installing snapshot through index {index} (term {index_term}) from {leader}"),
+        );
+        io.observe("install_snapshot", &[index, index_term]);
+        let batch = self.persister.start(Persist::SnapshotInstalled {
+            index,
+            term: index_term,
+            reply_to: from,
+            reply_term: self.term,
+        });
+        let op = io.set_len(file, 0);
+        self.persister.note_write(batch, op);
+        let op = io.write_at(file, 0, &encoded);
+        self.persister.note_write(batch, op);
+        self.persister.note_file(batch, file);
+        self.stats.snapshots_installed += 1;
+        self.pending_snapshot_data = Some((index, snap.data));
+    }
+
+    fn on_install_snapshot_resp(&mut self, io: &mut dyn Io, from: NodeId, term: u64, index: u64) {
+        if term > self.term {
+            self.step_down_and_persist(io, term);
+            return;
+        }
+        if self.role != Role::Leader || term != self.term {
+            return;
+        }
+        if index > NO_INDEX {
+            let m = self.match_index.entry(from).or_insert(NO_INDEX);
+            *m = (*m).max(index);
+            let m = *m;
+            self.next_index.insert(from, m + 1);
+            self.maybe_commit(io);
+        }
+    }
 
     /// Extend the durable claim as far as the confirmed ranges reach.
     ///
@@ -1620,7 +2104,7 @@ mod tests {
         assert_eq!(p.on_complete(1, true), BatchEvent::Nothing);
         assert_eq!(
             p.on_complete(2, true),
-            BatchEvent::NeedSync(b),
+            BatchEvent::NeedSync(b, FILE_WAL),
             "the sync waits for every write to be confirmed"
         );
         p.note_sync(b, 3);
@@ -1650,8 +2134,8 @@ mod tests {
         let b = p.start(Persist::Quiet);
         p.note_write(a, 10);
         p.note_write(b, 20);
-        assert_eq!(p.on_complete(20, true), BatchEvent::NeedSync(b));
-        assert_eq!(p.on_complete(10, true), BatchEvent::NeedSync(a));
+        assert_eq!(p.on_complete(20, true), BatchEvent::NeedSync(b, FILE_WAL));
+        assert_eq!(p.on_complete(10, true), BatchEvent::NeedSync(a, FILE_WAL));
         p.note_sync(b, 21);
         p.note_sync(a, 11);
         assert_eq!(

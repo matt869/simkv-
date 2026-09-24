@@ -46,6 +46,10 @@ COMMON OPTIONS:
     --max-batch N       Entries per AppendEntries (default 64). Small batches let
                         followers acknowledge at an old-term index, which is where
                         Raft's commit rule actually matters
+    --snapshot-threshold N
+                        Entries above the snapshot before taking a new one
+                        (default 400; 0 disables compaction). Low values force
+                        constant compaction and snapshot transfer
     --bug NAME          Inject a deliberate defect, to prove the checkers see it:
                         ack-before-sync, commit-any-term, vote-before-sync,
                         no-dedup, truncate-on-any-append
@@ -268,6 +272,9 @@ fn config(args: &Args) -> SimConfig {
     }
     if let Some(n) = args.opt_u64("max-events") {
         cfg.max_events = n;
+    }
+    if let Some(n) = args.opt_u64("snapshot-threshold") {
+        cfg.raft.snapshot_threshold = n;
     }
     if let Some(n) = args.opt_u64("max-batch") {
         cfg.raft.max_batch = (n as usize).max(1);

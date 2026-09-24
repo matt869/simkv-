@@ -66,6 +66,11 @@ sim shrink  --seed N                                cut a failure to a minimal r
 sim demo                                            a tour of all of the above
 ```
 
+Useful knobs for reaching states the defaults do not: `--max-batch N` (small
+batches make followers acknowledge at an old-term index), `--snapshot-threshold
+N` (low values force constant compaction and snapshot transfer),
+`--quorum-loss`, and `--bug NAME`.
+
 Exit status is 0 when nothing failed and 1 when something did, so a sweep drops
 straight into CI.
 
@@ -77,10 +82,15 @@ suspect.
 
 ## Scope
 
-The store implements leader election, log replication, and linearizable reads
-through the log, with `(client, seq)` deduplication so a retry cannot apply
-twice. Deliberately **not** implemented: snapshots, log compaction, and
-membership changes.
+The store implements leader election, log replication, linearizable reads
+through the log with `(client, seq)` deduplication so a retry cannot apply
+twice, and log compaction: snapshots go to two alternating files, and a
+follower that has fallen behind the compacted log is caught up with
+`InstallSnapshot`. The write-ahead file stays append-only, so compaction
+reclaims memory but not disk — doing that safely needs an atomic rename the
+storage model deliberately does not provide.
+
+Deliberately **not** implemented: membership changes and lease-based reads.
 
 ## Bugs found
 

@@ -25,7 +25,7 @@ use checker::{Report, Violation};
 use kvstore::log::{Entry, RaftLog};
 use kvstore::raft::{RaftMsg, Role};
 use kvstore::{KvServer, Message};
-use sim_io::{SimIo, FILE_WAL};
+use sim_io::{SimIo, FILE_SNAPSHOT_A, FILE_SNAPSHOT_B, FILE_WAL};
 use simcore::faults::{FaultAction, FaultHint};
 use simcore::scheduler::{Event, Fired};
 use simcore::trace::Level;
@@ -432,15 +432,17 @@ impl Cluster {
         if let Some((before, durable)) = self.pre_crash_log.get(&node) {
             let after = server.raft.log().entries();
             self.report.extend(durability::check_recovery(
-                now, node, before, *durable, after,
+                now,
+                node,
+                before,
+                *durable,
+                after,
+                server.raft.log().snapshot_index(),
             ));
         }
         // And the disk must not have forgotten a term this node acted on.
         if let Some(acted) = self.acted_term.get(&node).copied() {
-            let disk = DiskView {
-                id: node,
-                bytes: self.world.durable_image(node, FILE_WAL),
-            };
+            let disk = self.disk_view(node);
             self.report
                 .extend(durability::check_term_durable(now, node, acted, &disk));
         }
@@ -501,6 +503,18 @@ impl Cluster {
             .collect()
     }
 
+    /// Everything of a node's that would survive a power cut.
+    fn disk_view(&self, node: NodeId) -> DiskView {
+        DiskView {
+            id: node,
+            bytes: self.world.durable_image(node, FILE_WAL),
+            snapshots: (
+                self.world.durable_image(node, FILE_SNAPSHOT_A),
+                self.world.durable_image(node, FILE_SNAPSHOT_B),
+            ),
+        }
+    }
+
     fn is_client(&self, node: NodeId) -> bool {
         node.idx() >= self.cfg.servers
     }
@@ -517,10 +531,7 @@ impl Cluster {
             let Some(server) = &self.servers[i] else {
                 continue;
             };
-            let disk = DiskView {
-                id: node,
-                bytes: self.world.durable_image(node, FILE_WAL),
-            };
+            let disk = self.disk_view(node);
             let found = durability::check_durable_claim(
                 now,
                 node,
@@ -565,6 +576,7 @@ impl Cluster {
                         durable_index: s.raft.durable_index(),
                         incarnation: self.world.incarnation(id),
                         truncations: s.raft.stats().truncations,
+                        snapshot_index: s.raft.log().snapshot_index(),
                     },
                     None => NodeView {
                         id,
@@ -577,6 +589,7 @@ impl Cluster {
                         durable_index: 0,
                         incarnation: self.world.incarnation(id),
                         truncations: 0,
+                        snapshot_index: 0,
                     },
                 }
             })
@@ -630,14 +643,7 @@ impl Cluster {
                     })
             })
             .collect();
-        let disks: Vec<DiskView> = self
-            .members
-            .iter()
-            .map(|n| DiskView {
-                id: *n,
-                bytes: self.world.durable_image(*n, FILE_WAL),
-            })
-            .collect();
+        let disks: Vec<DiskView> = self.members.iter().map(|n| self.disk_view(*n)).collect();
         self.report.extend(durability::check_committed_durable(
             now,
             &committed,

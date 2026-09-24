@@ -50,7 +50,7 @@ impl Outcome {
         matches!(self, Outcome::Value(_) | Outcome::Written | Outcome::Cas(_))
     }
 
-    fn encode_into(&self, e: &mut Enc) {
+    pub(crate) fn encode_into(&self, e: &mut Enc) {
         match self {
             Outcome::Value(v) => {
                 e.u8(0).opt_str(v.as_deref());
@@ -70,7 +70,7 @@ impl Outcome {
         }
     }
 
-    fn decode_from(d: &mut Dec) -> crate::codec::Result<Outcome> {
+    pub(crate) fn decode_from(d: &mut Dec) -> crate::codec::Result<Outcome> {
         Ok(match d.u8()? {
             0 => Outcome::Value(d.opt_string()?),
             1 => Outcome::Written,
@@ -195,6 +195,52 @@ impl StateMachine {
             .map(|s| s.outcome.clone())
     }
 
+    /// Serialise the whole machine for a snapshot.
+    ///
+    /// The session table goes in with the data. Leaving it out would be a
+    /// quiet correctness bug: a node that restored from such a snapshot would
+    /// have forgotten which client requests it had already applied, and the
+    /// next retry of one of them would apply it a second time.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::new();
+        e.u32(self.state.len() as u32);
+        for (k, v) in &self.state {
+            e.str(k).str(v);
+        }
+        e.u32(self.sessions.len() as u32);
+        for (client, s) in &self.sessions {
+            e.u32(*client).u64(s.seq);
+            s.outcome.encode_into(&mut e);
+        }
+        e.into_vec()
+    }
+
+    /// Restore from a snapshot blob, replacing everything.
+    pub fn restore(bytes: &[u8], bug: InjectedBug) -> crate::codec::Result<StateMachine> {
+        let mut d = Dec::new(bytes);
+        let mut sm = StateMachine::with_bug(bug);
+        let keys = d.u32()? as usize;
+        if keys > 1 << 20 {
+            return Err(DecodeError::TooLong);
+        }
+        for _ in 0..keys {
+            let k = d.string()?;
+            let v = d.string()?;
+            sm.state.insert(k, v);
+        }
+        let sessions = d.u32()? as usize;
+        if sessions > 1 << 20 {
+            return Err(DecodeError::TooLong);
+        }
+        for _ in 0..sessions {
+            let client = d.u32()?;
+            let seq = d.u64()?;
+            let outcome = Outcome::decode_from(&mut d)?;
+            sm.sessions.insert(client, Session { seq, outcome });
+        }
+        Ok(sm)
+    }
+
     /// Run one committed command. Applying the same `(client, seq)` twice is
     /// a no-op that returns the original result.
     pub fn apply(&mut self, cmd: &Command) -> Outcome {
@@ -252,6 +298,7 @@ struct Waiting {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerStats {
+    pub snapshots_adopted: u64,
     pub requests: u64,
     pub deduped: u64,
     pub redirected: u64,
@@ -265,6 +312,7 @@ pub struct KvServer {
     sm: StateMachine,
     waiting: BTreeMap<u64, Waiting>,
     stats: ServerStats,
+    bug: InjectedBug,
 }
 
 impl KvServer {
@@ -275,14 +323,18 @@ impl KvServer {
         cfg: RaftConfig,
         seed: u64,
     ) -> KvServer {
-        KvServer {
+        let mut server = KvServer {
             raft: Raft::recover(io, id, members, cfg.clone(), seed),
             // The state machine is volatile and rebuilt by replaying the log as
             // entries are committed, exactly as Raft intends.
             sm: StateMachine::with_bug(cfg.bug),
             waiting: BTreeMap::new(),
             stats: ServerStats::default(),
-        }
+            bug: cfg.bug,
+        };
+        // A snapshot recovered from disk is the starting state machine.
+        server.adopt_snapshot(io);
+        server
     }
 
     pub fn id(&self) -> NodeId {
@@ -410,9 +462,51 @@ impl KvServer {
         self.drain(io);
     }
 
+    /// Adopt a snapshot that Raft has made durable, replacing the state
+    /// machine wholesale.
+    ///
+    /// Anything this node was still waiting to answer is released: those
+    /// entries are gone from the log, and the snapshot says nothing about
+    /// whether they committed. The client retries with the same `seq`, and the
+    /// session table inside the snapshot makes that retry idempotent.
+    fn adopt_snapshot(&mut self, io: &mut dyn Io) {
+        let Some(data) = self.raft.take_pending_restore() else {
+            return;
+        };
+        match StateMachine::restore(&data, self.bug) {
+            Ok(sm) => {
+                self.sm = sm;
+                self.stats.snapshots_adopted += 1;
+                io.trace(
+                    Level::Info,
+                    "kv",
+                    format!("adopted snapshot: {} keys", self.sm.state().len()),
+                );
+            }
+            Err(e) => {
+                // The snapshot passed its checksum and still did not decode:
+                // that is a bug in this code, not a damaged disk, and carrying
+                // on with a half-restored state machine would be worse.
+                io.trace(
+                    Level::Error,
+                    "kv",
+                    format!("snapshot failed to decode after passing its checksum: {e}"),
+                );
+            }
+        }
+        let pending: Vec<u64> = self.waiting.keys().copied().collect();
+        for i in pending {
+            if let Some(w) = self.waiting.remove(&i) {
+                self.stats.dropped += 1;
+                self.reply(io, w.to, w.req_id, Outcome::Dropped);
+            }
+        }
+    }
+
     /// Apply everything Raft has committed, answer whoever was waiting, and
     /// release requests this node can no longer resolve.
     fn drain(&mut self, io: &mut dyn Io) {
+        self.adopt_snapshot(io);
         for entry in self.raft.take_applied() {
             let index = entry.index;
             let outcome = self.sm.apply(&entry.cmd);
@@ -438,6 +532,13 @@ impl KvServer {
                 self.stats.dropped += 1;
                 self.reply(io, w.to, w.req_id, Outcome::Dropped);
             }
+        }
+
+        // With enough applied, replace the log prefix with an image of the
+        // state machine it produced.
+        if self.raft.wants_snapshot() {
+            let blob = self.sm.encode();
+            self.raft.take_snapshot(io, blob);
         }
 
         // Losing leadership means the pending proposals are no longer this
