@@ -334,6 +334,35 @@ mod tests {
         assert!(!out.failed(), "{}", out.detail());
     }
 
+    fn snapshot_regression(seed: u64, threshold: u64, servers: usize, max_batch: usize) {
+        let mut cfg = SimConfig::with_seed(seed);
+        cfg.servers = servers;
+        cfg.raft.snapshot_threshold = threshold;
+        cfg.raft.max_batch = max_batch;
+        cfg.duration = 8 * SECONDS;
+        cfg.settle = 12 * SECONDS;
+        cfg.drain = 3 * SECONDS;
+        cfg.normalise();
+        let out = run(cfg);
+        assert!(!out.failed(), "{}", out.detail());
+    }
+
+    #[test]
+    fn concurrent_snapshot_installs_do_not_share_an_image() {
+        // Two installs in flight shared one data slot; the first completed with
+        // the second's image missing, advanced last_applied over a state
+        // machine that had not moved, and served a stale read.
+        snapshot_regression(26, 3, 3, 64);
+    }
+
+    #[test]
+    fn a_snapshot_write_never_targets_the_only_durable_copy() {
+        // An install and a local snapshot in flight together: the second went
+        // into the file holding the only durable snapshot and truncated it, and
+        // a crash lost both -- along with every entry they had absorbed.
+        snapshot_regression(287, 10, 5, 2);
+    }
+
     #[test]
     fn config_normalisation_keeps_the_window_inside_the_run() {
         let mut cfg = SimConfig {

@@ -572,6 +572,22 @@ impl Snapshot {
 /// A snapshot larger than this is corruption, not data.
 const MAX_SNAPSHOT: usize = 64 << 20;
 
+/// Like [`pick_snapshot`], but also reports which input held it: 0 for `a`,
+/// 1 for `b`. A node has to know which file holds its only good snapshot so
+/// that it never writes the next one over it.
+pub fn pick_snapshot_with_source(a: &[u8], b: &[u8]) -> Option<(Snapshot, usize)> {
+    match (Snapshot::decode(a), Snapshot::decode(b)) {
+        (Some(x), Some(y)) => Some(if (x.index, x.seq) >= (y.index, y.seq) {
+            (x, 0)
+        } else {
+            (y, 1)
+        }),
+        (Some(x), None) => Some((x, 0)),
+        (None, Some(y)) => Some((y, 1)),
+        (None, None) => None,
+    }
+}
+
 /// Choose the better of the two snapshot files that is intact.
 ///
 /// Ordered by covered index first and sequence number only as a tie-break. The
@@ -911,6 +927,37 @@ mod tests {
                 "recovered state must be one of the two written states, got {got:?}"
             );
         }
+    }
+
+    fn snap(seq: u64, index: u64) -> Vec<u8> {
+        Snapshot {
+            seq,
+            index,
+            term: 1,
+            data: vec![index as u8],
+        }
+        .encode()
+    }
+
+    #[test]
+    fn the_snapshot_covering_more_wins_even_if_written_first() {
+        // Out-of-order installs: the older image can carry the higher seq.
+        let newer_content = snap(1, 15);
+        let written_later = snap(2, 12);
+        let (s, src) = pick_snapshot_with_source(&newer_content, &written_later).unwrap();
+        assert_eq!((s.index, src), (15, 0));
+    }
+
+    #[test]
+    fn a_torn_snapshot_falls_back_to_the_other_file() {
+        let good = snap(1, 10);
+        let mut torn = snap(2, 20);
+        torn.truncate(torn.len() / 2);
+        let (s, src) = pick_snapshot_with_source(&good, &torn).unwrap();
+        assert_eq!((s.index, src), (10, 0));
+        let (s, src) = pick_snapshot_with_source(&torn, &good).unwrap();
+        assert_eq!((s.index, src), (10, 1));
+        assert!(pick_snapshot_with_source(&torn, &[]).is_none());
     }
 
     #[test]

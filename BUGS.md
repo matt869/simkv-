@@ -263,39 +263,84 @@ reflected in the state, while the state had quietly reverted — which surfaced 
 a client reading a value that had been overwritten long before. The image is now
 only adopted when it is genuinely ahead of what has been applied.
 
-### Where this stopped: the retain-tail optimisation
+### Correction: the retain-tail optimisation was never the problem
 
-Raft section 7 permits keeping the log entries *above* an installed snapshot
-when the boundary entry matches, as an optimisation. With it enabled, a snapshot
-every five entries produced a linearizability violation (seed 425). Disabling it
-made that seed and all 500 in the sweep pass.
+The first version of this section said Raft section 7's retain-the-tail
+optimisation was unsafe here, because disabling it made seed 425 pass. That was
+wrong, and the reason it was wrong is worth more than the bug.
 
-It is disabled, and the reason is recorded rather than dressed up: **I did not
-establish why it was unsafe here.** Shipping an optimisation whose failure mode
-is not understood is worse than shipping without it. The cost is a leader
-re-sending entries it needn't have.
+## 6. Two snapshot installs sharing one slot
 
-One residual failure remains at `--snapshot-threshold 3` (seed 26, 1 in 500), a
-setting that snapshots more often than it commits. Thresholds from 5 upward are
-clean over 500 seeds each, and the default is 400. Recorded as open rather than
-tuned out of sight.
+**Severity: stale reads.** Found at `--snapshot-threshold 3`, seed 26.
+
+A snapshot received from the leader was held in a single field on the node
+until its `fsync` completed. The leader retries and the network reorders, so two
+installs can be in flight at once — and the second overwrote the first's image.
+When the first completed, there was no image to restore, but it advanced
+`last_applied` anyway. Raft believed the state machine reflected everything up
+to that index; the state machine had not moved.
+
+The client saw it as a read returning `c0v70` — a value overwritten four seconds
+earlier, by a write whose own window had long closed.
+
+**Fix:** the image travels inside the persist action that completes it, so two
+installs cannot see each other's data.
+
+**And the correction:** with this fixed, retain-tail was switched back on and
+seed 425 passed, along with 500 seeds at each of thresholds 3, 5, 10 and 400.
+Disabling the optimisation had never removed the bug. It changed which entries
+got re-sent, which changed the timing, which happened to stop two installs
+overlapping on that seed. **A bug going away when you remove a feature is not
+evidence that the feature caused it** — it is evidence that the feature is on
+the schedule the bug needs. The optimisation is back, with a comment saying so.
+
+---
+
+## 7. A snapshot written over the only durable copy
+
+**Severity: committed data lost.** Found at
+`--snapshot-threshold 10 --servers 5 --max-batch 2`, seed 287 — the first sweep
+run after fixing bug 6, in a configuration combining all three stress knobs.
+
+Snapshots alternate between two files so that a torn write can only ever damage
+one of them. That guarantee has a precondition nobody wrote down: **at most one
+snapshot write may be in flight, and it must never target the file holding the
+good copy.**
+
+Locally-taken snapshots had an in-flight guard. Installs from the leader did
+not. So a node could be installing snapshot 313 into one file while also
+taking its own snapshot 313 into the other — the file holding snapshot 303,
+its only durable one. That write begins by truncating the file. The crash came
+before either write synced:
+
+```
+recovered ... snapshot=0@0 damaged=true
+```
+
+No snapshot at all. And because the log had already been compacted past 303,
+the entries the snapshot had absorbed were in neither place.
+
+**Fix:** one in-flight guard covering both paths (an install that arrives while
+a write is landing is dropped, and the leader retries), and the target file is
+chosen as *whichever does not hold the newest durable snapshot* — tracked
+explicitly, including across restarts — rather than by alternating on a
+sequence number that knows nothing about which write actually landed.
+
+Both seeds are now regression tests.
 
 ---
 
 ## Current status
 
 ```
-6000 seeds across six configurations → no failures
+7000 seeds across seven configurations → no failures
   (default; --max-batch 2; 5 servers; majority-failure allowed;
-   --snapshot-threshold 20; and 5 servers + threshold 10 + batch 2)
-2500 seeds across snapshot thresholds 5, 10, 50, 400 and off → no failures
-  (threshold 3 has one known failure, seed 26 — see bug 5)
+   --snapshot-threshold 3; 5 servers + threshold 10 + batch 2;
+   7 servers + threshold 5 + majority-failure allowed)
+2000 seeds across snapshot thresholds 3, 5, 10, 400, retain-tail on
+  → no failures
 5000 seeds, 3-node cluster, crashes + partitions + clock skew + torn writes
   → 45.2M events, 2.4M operations checked, no failures
-
-1000 seeds, 20s runs           → no failures
-400 seeds, 5 servers, 2 keys   → no failures
-400 seeds, majority may fail   → no failures (safety only; liveness not expected)
 ```
 
 Absence of failures is not proof of correctness. It means the bugs that remain

@@ -26,11 +26,11 @@
 
 use crate::codec::{Dec, DecodeError, Enc};
 use crate::log::{
-    pick_snapshot, recover_hard_state, recover_log_any_start, Command, Entry, HardState, RaftLog,
-    Snapshot, NO_INDEX, SLOT_SIZE, STATE_FILE_SIZE,
+    pick_snapshot_with_source, recover_hard_state, recover_log_any_start, Command, Entry,
+    HardState, RaftLog, Snapshot, NO_INDEX, SLOT_SIZE, STATE_FILE_SIZE,
 };
 use crate::Message;
-use sim_io::storage::{snapshot_file, FILE_SNAPSHOT_A, FILE_SNAPSHOT_B, FILE_WAL};
+use sim_io::storage::{FILE_SNAPSHOT_A, FILE_SNAPSHOT_B, FILE_WAL};
 use sim_io::{Deadline, Io, PendingOps, TimerTag};
 use simcore::disk::{FileId, OpId};
 use simcore::rng::Rng;
@@ -380,11 +380,19 @@ enum Persist {
     /// Hard state is durable; the message may now be sent.
     Reply { to: NodeId, msg: RaftMsg },
     /// A snapshot this node took is durable: the log may now be compacted.
-    SnapshotTaken { index: u64, term: u64 },
+    SnapshotTaken { index: u64, term: u64, file: FileId },
     /// A snapshot received from the leader is durable: adopt it and answer.
+    ///
+    /// The image travels with the action rather than in a field on the node.
+    /// Two installs can be in flight at once -- the leader retries, and the
+    /// network reorders -- and a single slot meant the second quietly replaced
+    /// the first. The first then completed with no image to restore, advancing
+    /// the applied index over a state machine that had not moved.
     SnapshotInstalled {
         index: u64,
         term: u64,
+        data: Vec<u8>,
+        file: FileId,
         reply_to: NodeId,
         reply_term: u64,
     },
@@ -585,11 +593,19 @@ pub struct Raft {
     /// A snapshot that has been received and made durable, waiting for the
     /// state machine above to adopt it.
     pending_restore: Option<Vec<u8>>,
-    /// Whether a snapshot write is already in flight, so one is not started
-    /// again on every applied entry.
+    /// Whether a snapshot write -- taken locally *or* installed from the
+    /// leader -- is in flight. At most one may be.
+    ///
+    /// Two snapshot files only protect against a torn write if one of them is
+    /// always intact. With two writes in flight, the second goes to whichever
+    /// file the first is not using, which is the file holding the only durable
+    /// snapshot; it is truncated before the new image lands, and a crash then
+    /// loses both. Everything the snapshot had absorbed -- and the log no longer
+    /// holds -- goes with them.
     snapshot_in_flight: bool,
-    /// A snapshot being installed from the leader, held until it is durable.
-    pending_snapshot_data: Option<(u64, Vec<u8>)>,
+    /// The file holding the newest durable snapshot. The next write goes to the
+    /// other one.
+    durable_snapshot_file: Option<FileId>,
     /// The most recent snapshot, kept in memory so a follower that has fallen
     /// behind the compacted log can be sent one without reading it back.
     snapshot_data: Vec<u8>,
@@ -629,9 +645,17 @@ impl Raft {
         let hs = recover_hard_state(&bytes);
 
         // The snapshot comes first: it decides where the log begins.
-        let snap = pick_snapshot(&io.read_all(FILE_SNAPSHOT_A), &io.read_all(FILE_SNAPSHOT_B));
+        let snap =
+            pick_snapshot_with_source(&io.read_all(FILE_SNAPSHOT_A), &io.read_all(FILE_SNAPSHOT_B));
+        let durable_snapshot_file = snap.as_ref().map(|(_, src)| {
+            if *src == 0 {
+                FILE_SNAPSHOT_A
+            } else {
+                FILE_SNAPSHOT_B
+            }
+        });
         let (snap_index, snap_term, snapshot_seq, restore_blob) = match snap {
-            Some(s) => (s.index, s.term, s.seq, Some(s.data)),
+            Some((s, _)) => (s.index, s.term, s.seq, Some(s.data)),
             None => (0, 0, 0, None),
         };
         let snapshot_bytes = restore_blob.clone().unwrap_or_default();
@@ -722,7 +746,7 @@ impl Raft {
             snapshot_seq: snapshot_seq + 1,
             pending_restore: restore_blob,
             snapshot_in_flight: false,
-            pending_snapshot_data: None,
+            durable_snapshot_file,
             snapshot_data: snapshot_bytes,
             highest_snapshot: snap_index,
             state_seq: hs.seq + 1,
@@ -1650,8 +1674,9 @@ impl Raft {
                     self.maybe_commit(io);
                 }
             }
-            Persist::SnapshotTaken { index, term } => {
+            Persist::SnapshotTaken { index, term, file } => {
                 self.snapshot_in_flight = false;
+                self.durable_snapshot_file = Some(file);
                 // Only now, with the snapshot on stable storage, may the
                 // entries it replaces be dropped.
                 self.log.compact_to(index, term);
@@ -1669,26 +1694,32 @@ impl Raft {
             Persist::SnapshotInstalled {
                 index,
                 term,
+                data,
+                file,
                 reply_to,
                 reply_term,
             } => {
-                // Raft section 7 allows keeping the entries above a snapshot
-                // when the boundary entry matches, as an optimisation. It is
-                // deliberately not taken here: with it, a snapshot every five
-                // entries produced a linearizability violation that disabling
-                // it made go away across 500 seeds, and shipping an
-                // optimisation whose failure is not understood is worse than
-                // shipping without it. The cost is that the leader re-sends
-                // entries it need not have; the benefit is that an installed
-                // snapshot means exactly one thing.
-                let keeps_tail = false;
-                if index < self.commit_index {
+                self.snapshot_in_flight = false;
+                // The image is durable in `file` whether or not it is adopted
+                // below, and it is at least as new as anything else on disk.
+                self.durable_snapshot_file = Some(file);
+                // Raft section 7: when this node already holds the snapshot's
+                // last entry at the same term, the entries above it are still
+                // valid and are kept rather than re-fetched.
+                //
+                // This was switched off for a while, because a linearizability
+                // violation went away when it was. It turned out the fault was
+                // elsewhere entirely -- two concurrent installs sharing one data
+                // slot -- and disabling this merely perturbed the schedule
+                // enough to hide it. A bug disappearing when you remove a
+                // feature is not evidence that the feature caused it.
+                let keeps_tail = self.log.term_at(index) == Some(term);
+                if !keeps_tail && index < self.commit_index {
                     // This node committed past the snapshot while the write was
                     // in flight. Adopting it now would replace a log containing
                     // committed entries with one that ends below the commit
                     // index. The snapshot is simply stale; answer with where
                     // this node actually is and leave the log alone.
-                    self.pending_snapshot_data = None;
                     self.send(
                         io,
                         reply_to,
@@ -1709,14 +1740,9 @@ impl Raft {
                 // to the snapshot, and the difference shows up as a client
                 // reading a value that was overwritten long ago.
                 let restore = index > self.last_applied;
-                match self.pending_snapshot_data.take() {
-                    Some((pending_index, data)) if pending_index == index => {
-                        self.snapshot_data = data.clone();
-                        if restore {
-                            self.pending_restore = Some(data);
-                        }
-                    }
-                    _ => {}
+                self.snapshot_data = data.clone();
+                if restore {
+                    self.pending_restore = Some(data);
                 }
                 // If this node already holds the snapshot's last entry with the
                 // same term, everything after it is still valid and is kept --
@@ -1793,7 +1819,7 @@ impl Raft {
         self.snapshot_seq += 1;
         self.highest_snapshot = self.highest_snapshot.max(index);
         self.snapshot_in_flight = true;
-        let file = snapshot_file(seq);
+        let file = self.next_snapshot_file();
         let snap = Snapshot {
             seq,
             index,
@@ -1811,7 +1837,9 @@ impl Raft {
             ),
         );
         io.observe("snapshot", &[index, term]);
-        let batch = self.persister.start(Persist::SnapshotTaken { index, term });
+        let batch = self
+            .persister
+            .start(Persist::SnapshotTaken { index, term, file });
         // Truncate first so a shorter snapshot cannot leave a longer one's tail
         // behind it, which would decode as garbage rather than as absent.
         let op = io.set_len(file, 0);
@@ -1820,6 +1848,15 @@ impl Raft {
         self.persister.note_write(batch, op);
         self.persister.note_file(batch, file);
         self.stats.snapshots_taken += 1;
+    }
+
+    /// The file the next snapshot must go to: whichever one does not hold the
+    /// newest durable snapshot.
+    fn next_snapshot_file(&self) -> FileId {
+        match self.durable_snapshot_file {
+            Some(f) if f == FILE_SNAPSHOT_A => FILE_SNAPSHOT_B,
+            _ => FILE_SNAPSHOT_A,
+        }
     }
 
     /// A snapshot received from the leader, waiting to be adopted by the state
@@ -1878,10 +1915,17 @@ impl Raft {
             return;
         }
 
+        if self.snapshot_in_flight {
+            // Another snapshot write is still landing. Starting a second one
+            // would put it over the only durable copy. Say nothing: the leader
+            // retries on its next heartbeat, by which time this one is done.
+            return;
+        }
         let seq = self.snapshot_seq;
         self.snapshot_seq += 1;
         self.highest_snapshot = self.highest_snapshot.max(index);
-        let file = snapshot_file(seq);
+        self.snapshot_in_flight = true;
+        let file = self.next_snapshot_file();
         let snap = Snapshot {
             seq,
             index,
@@ -1898,6 +1942,8 @@ impl Raft {
         let batch = self.persister.start(Persist::SnapshotInstalled {
             index,
             term: index_term,
+            data: snap.data.clone(),
+            file,
             reply_to: from,
             reply_term: self.term,
         });
@@ -1907,7 +1953,6 @@ impl Raft {
         self.persister.note_write(batch, op);
         self.persister.note_file(batch, file);
         self.stats.snapshots_installed += 1;
-        self.pending_snapshot_data = Some((index, snap.data));
     }
 
     fn on_install_snapshot_resp(&mut self, io: &mut dyn Io, from: NodeId, term: u64, index: u64) {
