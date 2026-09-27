@@ -21,6 +21,9 @@
 //! rather than entries. The write-ahead file itself stays append-only -- see
 //! `recover_log_any_start` for why.
 //!
+//! Reads can bypass the log entirely through ReadIndex (section 6.4); see
+//! `request_read` for the two conditions that make that safe.
+//!
 //! Not implemented, deliberately: membership changes and lease-based reads.
 //! See the crate docs.
 
@@ -68,15 +71,25 @@ pub enum InjectedBug {
     /// Truncate the log to whatever the leader sent, even when the leader is
     /// sending a stale suffix.
     TruncateOnAnyAppend,
+    /// Serve a ReadIndex read without first confirming leadership with a
+    /// majority. A leader that has been partitioned away, and replaced, keeps
+    /// answering from a state machine that no longer moves.
+    ReadWithoutQuorum,
+    /// Serve a ReadIndex read before this leader has committed an entry of its
+    /// own term. Until it has, its commit index can lag what an earlier leader
+    /// already committed and acknowledged.
+    ReadBeforeTermCommit,
 }
 
 impl InjectedBug {
-    pub const ALL: [InjectedBug; 5] = [
+    pub const ALL: [InjectedBug; 7] = [
         InjectedBug::AckBeforeSync,
         InjectedBug::CommitAnyTerm,
         InjectedBug::VoteBeforeSync,
         InjectedBug::NoDedup,
         InjectedBug::TruncateOnAnyAppend,
+        InjectedBug::ReadWithoutQuorum,
+        InjectedBug::ReadBeforeTermCommit,
     ];
 
     pub fn name(self) -> &'static str {
@@ -87,6 +100,8 @@ impl InjectedBug {
             InjectedBug::VoteBeforeSync => "vote-before-sync",
             InjectedBug::NoDedup => "no-dedup",
             InjectedBug::TruncateOnAnyAppend => "truncate-on-any-append",
+            InjectedBug::ReadWithoutQuorum => "read-without-quorum",
+            InjectedBug::ReadBeforeTermCommit => "read-before-term-commit",
         }
     }
 
@@ -118,6 +133,40 @@ impl InjectedBug {
             InjectedBug::VoteBeforeSync => "votes before the vote is durable",
             InjectedBug::NoDedup => "applies retried client requests twice",
             InjectedBug::TruncateOnAnyAppend => "truncates the log on any mismatch in length",
+            InjectedBug::ReadWithoutQuorum => "serves reads without confirming leadership",
+            InjectedBug::ReadBeforeTermCommit => {
+                "serves reads before committing an entry of its own term"
+            }
+        }
+    }
+}
+
+/// How a leader answers a `Get`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ReadMode {
+    /// Propose the read as a log entry and answer when it commits. Simple and
+    /// obviously correct, and it costs a disk sync on a majority per read.
+    Log,
+    /// Raft section 6.4. Record the commit index, confirm leadership with one
+    /// round of probes to a majority, wait until that index is applied, then
+    /// answer from the state machine. No log entry and no disk write.
+    #[default]
+    ReadIndex,
+}
+
+impl ReadMode {
+    pub fn parse(s: &str) -> Option<ReadMode> {
+        match s {
+            "log" => Some(ReadMode::Log),
+            "index" | "read-index" => Some(ReadMode::ReadIndex),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ReadMode::Log => "log",
+            ReadMode::ReadIndex => "index",
         }
     }
 }
@@ -151,6 +200,8 @@ pub struct RaftConfig {
     /// Take a snapshot once this many entries sit above the last one. Zero
     /// disables compaction entirely.
     pub snapshot_threshold: u64,
+    /// How reads are served.
+    pub read_mode: ReadMode,
     /// A deliberate defect, for verifying that the checkers work.
     pub bug: InjectedBug,
 }
@@ -162,6 +213,7 @@ impl Default for RaftConfig {
             heartbeat_interval: 50 * MILLIS,
             max_batch: 64,
             snapshot_threshold: 400,
+            read_mode: ReadMode::ReadIndex,
             bug: InjectedBug::None,
         }
     }
@@ -211,6 +263,20 @@ pub enum RaftMsg {
         /// The index the follower now holds, once the snapshot is durable.
         index: u64,
     },
+    /// "Am I still your leader?" -- the confirmation round for ReadIndex.
+    ///
+    /// A separate message rather than a field on AppendEntries: the append
+    /// reply is often deferred behind an fsync, and a read has no reason to
+    /// wait for a disk.
+    ReadProbe {
+        term: u64,
+        leader: NodeId,
+        seq: u64,
+    },
+    ReadProbeResp {
+        term: u64,
+        seq: u64,
+    },
 }
 
 impl RaftMsg {
@@ -221,7 +287,9 @@ impl RaftMsg {
             | RaftMsg::AppendEntries { term, .. }
             | RaftMsg::AppendEntriesResp { term, .. }
             | RaftMsg::InstallSnapshot { term, .. }
-            | RaftMsg::InstallSnapshotResp { term, .. } => *term,
+            | RaftMsg::InstallSnapshotResp { term, .. }
+            | RaftMsg::ReadProbe { term, .. }
+            | RaftMsg::ReadProbeResp { term, .. } => *term,
         }
     }
 
@@ -290,6 +358,12 @@ impl RaftMsg {
             RaftMsg::InstallSnapshotResp { term, index } => {
                 e.u8(6).u64(*term).u64(*index);
             }
+            RaftMsg::ReadProbe { term, leader, seq } => {
+                e.u8(7).u64(*term).u32(leader.0).u64(*seq);
+            }
+            RaftMsg::ReadProbeResp { term, seq } => {
+                e.u8(8).u64(*term).u64(*seq);
+            }
         }
     }
 
@@ -346,6 +420,15 @@ impl RaftMsg {
             6 => RaftMsg::InstallSnapshotResp {
                 term: d.u64()?,
                 index: d.u64()?,
+            },
+            7 => RaftMsg::ReadProbe {
+                term: d.u64()?,
+                leader: NodeId(d.u32()?),
+                seq: d.u64()?,
+            },
+            8 => RaftMsg::ReadProbeResp {
+                term: d.u64()?,
+                seq: d.u64()?,
             },
             t => return Err(DecodeError::BadTag(t)),
         })
@@ -560,6 +643,33 @@ pub struct RaftStats {
     pub snapshots_taken: u64,
     pub snapshots_installed: u64,
     pub snapshots_sent: u64,
+    /// Reads started through ReadIndex, and probe rounds sent for them.
+    pub reads_requested: u64,
+    pub read_probes_sent: u64,
+}
+
+/// What happened to a ReadIndex read, for the checker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadEvent {
+    /// Accepted, and will observe everything at or below `read_index`.
+    Requested { id: u64, read_index: u64 },
+    /// Answered from the state machine.
+    Served { id: u64 },
+}
+
+/// A read waiting for its leadership confirmation and for the state machine to
+/// catch up to the point it must observe.
+#[derive(Clone, Copy, Debug)]
+struct PendingRead {
+    id: u64,
+    /// The commit index when the read arrived. Anything acknowledged to any
+    /// client before this read began is at or below it.
+    read_index: u64,
+    /// The probe round this read needs acknowledged. An acknowledgement of an
+    /// *earlier* round proves nothing: it could predate the read, and with it
+    /// the election that deposed this leader.
+    seq: u64,
+    confirmed: bool,
 }
 
 pub struct Raft {
@@ -613,6 +723,13 @@ pub struct Raft {
     /// landed yet. Stops an older snapshot being written over a newer one when
     /// the network delivers them out of order.
     highest_snapshot: u64,
+    /// Monotonic probe round counter for ReadIndex.
+    read_seq: u64,
+    pending_reads: Vec<PendingRead>,
+    /// Per follower: the highest probe round it has acknowledged in this term.
+    probe_acked: BTreeMap<NodeId, u64>,
+    /// Read lifecycle, drained by whoever is checking this node.
+    read_events: Vec<ReadEvent>,
     /// Highest term known to be on stable storage.
     ///
     /// No message carrying a term above this may leave the node: announcing a
@@ -751,6 +868,10 @@ impl Raft {
             highest_snapshot: snap_index,
             state_seq: hs.seq + 1,
             durable_term: hs.term,
+            read_seq: 0,
+            pending_reads: Vec::new(),
+            probe_acked: BTreeMap::new(),
+            read_events: Vec::new(),
             persister: Persister::default(),
             election_timer: Deadline::new(),
             heartbeat_timer: Deadline::new(),
@@ -890,6 +1011,10 @@ impl Raft {
             RaftMsg::InstallSnapshotResp { term, index } => {
                 self.on_install_snapshot_resp(io, from, term, index)
             }
+            RaftMsg::ReadProbe { term, leader, seq } => {
+                self.on_read_probe(io, from, term, leader, seq)
+            }
+            RaftMsg::ReadProbeResp { term, seq } => self.on_read_probe_resp(io, from, term, seq),
         }
     }
 
@@ -915,6 +1040,11 @@ impl Raft {
                     return;
                 }
                 self.broadcast_append(io);
+                // Probes can be lost like anything else; a read still waiting
+                // for its majority is asked about again every heartbeat.
+                if self.pending_reads.iter().any(|r| !r.confirmed) {
+                    self.broadcast_probe(io);
+                }
                 self.reset_heartbeat_timer(io);
             }
             _ => {}
@@ -989,6 +1119,161 @@ impl Raft {
             }
         }
         out
+    }
+
+    // ---- ReadIndex ---------------------------------------------------------
+
+    pub fn read_mode(&self) -> ReadMode {
+        self.cfg.read_mode
+    }
+
+    /// Begin a linearizable read that does not touch the log.
+    ///
+    /// Returns `false` if this node cannot serve one that way right now, in
+    /// which case the caller should put the read through the log instead.
+    ///
+    /// Two conditions, and both are load-bearing:
+    ///
+    /// * **This leader has committed an entry of its own term.** Until it has,
+    ///   its commit index can be behind entries an earlier leader committed and
+    ///   acknowledged to clients -- a read at that index would miss them. The
+    ///   no-op a new leader appends exists partly to end this window quickly.
+    /// * **A majority confirms it is still leader, after the read arrived.**
+    ///   Otherwise a leader partitioned away and replaced would go on answering
+    ///   from a state machine the rest of the cluster has moved past.
+    pub fn request_read(&mut self, io: &mut dyn Io, id: u64) -> bool {
+        if self.cfg.read_mode != ReadMode::ReadIndex || self.role != Role::Leader || self.failed {
+            return false;
+        }
+        let own_term_committed = self.log.term_at(self.commit_index) == Some(self.term);
+        if !own_term_committed && self.cfg.bug != InjectedBug::ReadBeforeTermCommit {
+            return false;
+        }
+        self.read_seq += 1;
+        let confirmed = self.members.len() == 1 || self.cfg.bug == InjectedBug::ReadWithoutQuorum;
+        self.pending_reads.push(PendingRead {
+            id,
+            read_index: self.commit_index,
+            seq: self.read_seq,
+            confirmed,
+        });
+        self.stats.reads_requested += 1;
+        self.read_events.push(ReadEvent::Requested {
+            id,
+            read_index: self.commit_index,
+        });
+        io.observe("read_index", &[id, self.commit_index]);
+        if !confirmed {
+            self.broadcast_probe(io);
+        }
+        true
+    }
+
+    /// Reads that are confirmed and whose index has been applied: the state
+    /// machine may answer them now.
+    pub fn take_ready_reads(&mut self) -> Vec<u64> {
+        if self.role != Role::Leader {
+            return Vec::new();
+        }
+        let applied = self.last_applied;
+        let mut ready = Vec::new();
+        self.pending_reads.retain(|r| {
+            if r.confirmed && applied >= r.read_index {
+                ready.push(r.id);
+                false
+            } else {
+                true
+            }
+        });
+        self.read_events
+            .extend(ready.iter().map(|id| ReadEvent::Served { id: *id }));
+        ready
+    }
+
+    /// Read lifecycle events since the last call.
+    pub fn take_read_events(&mut self) -> Vec<ReadEvent> {
+        std::mem::take(&mut self.read_events)
+    }
+
+    /// Reads this node can no longer answer because it is no longer leader.
+    pub fn take_failed_reads(&mut self) -> Vec<u64> {
+        if self.role == Role::Leader {
+            return Vec::new();
+        }
+        self.pending_reads.drain(..).map(|r| r.id).collect()
+    }
+
+    fn broadcast_probe(&mut self, io: &mut dyn Io) {
+        let msg = RaftMsg::ReadProbe {
+            term: self.term,
+            leader: self.id,
+            seq: self.read_seq,
+        };
+        for p in self.peers() {
+            self.send(io, p, msg.clone());
+        }
+        self.stats.read_probes_sent += 1;
+    }
+
+    fn on_read_probe(
+        &mut self,
+        io: &mut dyn Io,
+        from: NodeId,
+        term: u64,
+        leader: NodeId,
+        seq: u64,
+    ) {
+        if term < self.term {
+            // A deposed leader asking. The higher term in the reply is what
+            // makes it step down.
+            self.send(
+                io,
+                from,
+                RaftMsg::ReadProbeResp {
+                    term: self.term,
+                    seq,
+                },
+            );
+            return;
+        }
+        if term > self.term {
+            // Adopt the term first; an answer can wait for the next probe,
+            // which comes with the next heartbeat.
+            self.step_down_and_persist(io, term);
+            self.leader = Some(leader);
+            return;
+        }
+        if self.role == Role::Leader {
+            // Two leaders in one term; election safety has already failed and
+            // the invariant checker will say so. Do not vouch for the other.
+            return;
+        }
+        if self.role == Role::Candidate {
+            self.role = Role::Follower;
+            self.votes.clear();
+        }
+        self.leader = Some(leader);
+        self.reset_election_timer(io);
+        self.send(io, from, RaftMsg::ReadProbeResp { term, seq });
+    }
+
+    fn on_read_probe_resp(&mut self, io: &mut dyn Io, from: NodeId, term: u64, seq: u64) {
+        if term > self.term {
+            self.step_down_and_persist(io, term);
+            return;
+        }
+        if self.role != Role::Leader || term != self.term {
+            return;
+        }
+        let acked = self.probe_acked.entry(from).or_insert(0);
+        *acked = (*acked).max(seq);
+        let quorum = self.quorum();
+        for r in self.pending_reads.iter_mut().filter(|r| !r.confirmed) {
+            let votes = 1 + self.probe_acked.values().filter(|a| **a >= r.seq).count();
+            if votes >= quorum {
+                r.confirmed = true;
+            }
+        }
     }
 
     // ---- elections --------------------------------------------------------
@@ -1113,6 +1398,9 @@ impl Raft {
         let next = self.log.last_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
+        // Acknowledgements are per term: one given to this node while it led an
+        // earlier term says nothing about now.
+        self.probe_acked.clear();
         for p in self.peers() {
             self.next_index.insert(p, next);
             self.match_index.insert(p, NO_INDEX);
@@ -1761,8 +2049,20 @@ impl Raft {
                     io.set_len(FILE_WAL, LOG_REGION);
                     io.sync(FILE_WAL);
                 }
-                self.parked.clear();
+                if keeps_tail {
+                    // The entries above the snapshot were kept, and so were the
+                    // bytes backing them -- compaction does not move anything in
+                    // the file. Durability claims for them are still true. They
+                    // were once cleared here along with everything else, which
+                    // left this node's durable index stuck below entries it had
+                    // in fact synced: it acknowledged the same number forever,
+                    // and the leader, seeing it behind, resent forever.
+                    self.parked.retain(|(_, to)| *to > index);
+                } else {
+                    self.parked.clear();
+                }
                 self.durable_index = self.durable_index.max(index).min(self.log.last_index());
+                self.advance_durable(io);
                 self.commit_index = self.commit_index.max(index);
                 if restore {
                     // The state machine is now exactly the snapshot, so this is
@@ -2089,6 +2389,20 @@ mod tests {
     #[test]
     fn messages_round_trip() {
         let msgs = vec![
+            RaftMsg::ReadProbe {
+                term: 4,
+                leader: NodeId(1),
+                seq: 99,
+            },
+            RaftMsg::ReadProbeResp { term: 4, seq: 99 },
+            RaftMsg::InstallSnapshot {
+                term: 5,
+                leader: NodeId(2),
+                index: 40,
+                index_term: 5,
+                data: vec![1, 2, 3],
+            },
+            RaftMsg::InstallSnapshotResp { term: 5, index: 40 },
             RaftMsg::RequestVote {
                 term: 7,
                 candidate: NodeId(3),

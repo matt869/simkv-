@@ -3,11 +3,11 @@
 //!
 //! Two decisions here do most of the work of being linearizable:
 //!
-//! * **Reads go through the log.** A `Get` is proposed like any write and
-//!   answered when it commits. That is slower than reading local state, and it
-//!   is also the only version that is obviously correct: a leader that has been
-//!   deposed but does not know it yet cannot serve a stale read, because its
-//!   read never commits.
+//! * **Reads never see a deposed leader's state.** By default a `Get` is served
+//!   through ReadIndex: the leader confirms with a majority that it is still
+//!   leader *after* the read arrives, and only then answers from memory. With
+//!   `ReadMode::Log` a `Get` is proposed like any write instead, which is slower
+//!   and obviously correct: a deposed leader's read simply never commits.
 //! * **Every command carries `(client, seq)`, and the state machine keeps the
 //!   last result per client.** A retry of the same `seq` is answered from that
 //!   cache instead of being applied twice. Without it, a client that retries
@@ -287,6 +287,14 @@ impl StateMachine {
     }
 }
 
+/// A client waiting on a ReadIndex read.
+#[derive(Clone, Debug)]
+struct WaitingRead {
+    to: NodeId,
+    req_id: u64,
+    key: String,
+}
+
 /// A client waiting on a log index.
 #[derive(Clone, Debug)]
 struct Waiting {
@@ -298,6 +306,8 @@ struct Waiting {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ServerStats {
+    /// Reads answered through ReadIndex, without a log entry.
+    pub index_reads: u64,
     pub snapshots_adopted: u64,
     pub requests: u64,
     pub deduped: u64,
@@ -311,6 +321,8 @@ pub struct KvServer {
     pub raft: Raft,
     sm: StateMachine,
     waiting: BTreeMap<u64, Waiting>,
+    waiting_reads: BTreeMap<u64, WaitingRead>,
+    next_read_id: u64,
     stats: ServerStats,
     bug: InjectedBug,
 }
@@ -329,6 +341,8 @@ impl KvServer {
             // entries are committed, exactly as Raft intends.
             sm: StateMachine::with_bug(cfg.bug),
             waiting: BTreeMap::new(),
+            waiting_reads: BTreeMap::new(),
+            next_read_id: 1,
             stats: ServerStats::default(),
             bug: cfg.bug,
         };
@@ -422,6 +436,28 @@ impl KvServer {
             self.reply(io, from, req_id, outcome);
             return;
         }
+        // A read that can be served without the log is. Reads need no
+        // deduplication: answering one twice changes nothing, and each answer
+        // falls inside the window of the operation the client is waiting on.
+        if let Op::Get { key } = &op {
+            let id = self.next_read_id;
+            self.next_read_id += 1;
+            if self.raft.request_read(io, id) {
+                self.waiting_reads.insert(
+                    id,
+                    WaitingRead {
+                        to: from,
+                        req_id,
+                        key: key.clone(),
+                    },
+                );
+                self.drain(io);
+                return;
+            }
+            // Otherwise -- no entry of this term committed yet, or reads are
+            // configured to go through the log -- fall through and propose it.
+        }
+
         // Also deduplicate against a copy that is already in flight, so a
         // duplicated network message does not occupy two log slots.
         if let Some((_, w)) = self
@@ -531,6 +567,23 @@ impl KvServer {
             if let Some(w) = self.waiting.remove(&i) {
                 self.stats.dropped += 1;
                 self.reply(io, w.to, w.req_id, Outcome::Dropped);
+            }
+        }
+
+        // ReadIndex reads whose leadership is confirmed and whose index is now
+        // applied. They are answered *after* the apply loop above, so the state
+        // machine already reflects everything at or below the read index.
+        for id in self.raft.take_ready_reads() {
+            if let Some(r) = self.waiting_reads.remove(&id) {
+                let value = self.sm.state().get(&r.key).cloned();
+                self.stats.index_reads += 1;
+                self.reply(io, r.to, r.req_id, Outcome::Value(value));
+            }
+        }
+        for id in self.raft.take_failed_reads() {
+            if let Some(r) = self.waiting_reads.remove(&id) {
+                self.stats.dropped += 1;
+                self.reply(io, r.to, r.req_id, Outcome::Dropped);
             }
         }
 

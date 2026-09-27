@@ -14,9 +14,11 @@
 //!   that have fallen behind. Disk space is not reclaimed: the write-ahead file
 //!   is append-only, because compacting it in place would need an atomic
 //!   rename, and the storage model deliberately does not offer one.
-//! * Reads go through the log, which is the simple way to be linearizable.
-//!   Lease-based or read-index reads would be faster and much easier to get
-//!   subtly wrong.
+//! * Reads use ReadIndex by default: answered from the leader's memory after
+//!   one round confirming it is still leader, with no log entry. Putting reads
+//!   through the log remains available and is simpler to trust. Lease-based
+//!   reads are not implemented: they depend on bounded clock drift, and this
+//!   simulator skews and steps every clock on purpose.
 
 pub mod log;
 pub mod raft;

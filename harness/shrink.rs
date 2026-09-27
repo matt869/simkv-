@@ -17,6 +17,7 @@
 //! deduction, and it is why every candidate is verified by actually running it.
 
 use crate::{run, RunOutcome, SimConfig};
+use kvstore::raft::ReadMode;
 use simcore::{Nanos, MILLIS};
 
 #[derive(Debug)]
@@ -109,7 +110,8 @@ pub fn describe(cfg: &SimConfig) -> String {
     .collect();
     format!(
         "  seed={} servers={} clients={} keys={} duration={}ms settle={}ms\n  \
-         faults=[{}]\n  net=[{}]\n  disk=[{}]\n  workload=[{}]",
+         faults=[{}]\n  net=[{}]\n  disk=[{}]\n  workload=[{}]\n  \
+         raft=[reads={} batch={} snapshot-every={}]",
         cfg.seed,
         cfg.servers,
         cfg.clients,
@@ -120,6 +122,9 @@ pub fn describe(cfg: &SimConfig) -> String {
         net.join(", "),
         disk.join(", "),
         mix.join(", "),
+        cfg.raft.read_mode.name(),
+        cfg.raft.max_batch,
+        cfg.raft.snapshot_threshold,
     )
 }
 
@@ -252,6 +257,13 @@ fn candidates() -> Vec<Candidate> {
             (cfg.settle > 5 * simcore::SECONDS).then(|| {
                 let mut n = cfg.clone();
                 n.settle = (cfg.settle / 2).max(5 * simcore::SECONDS);
+                n
+            })
+        }),
+        c("reads through the log instead of ReadIndex", |cfg| {
+            (cfg.raft.read_mode == ReadMode::ReadIndex).then(|| {
+                let mut n = cfg.clone();
+                n.raft.read_mode = ReadMode::Log;
                 n
             })
         }),
@@ -404,6 +416,7 @@ mod tests {
         cfg.workload.cas_weight = 0;
         cfg.workload.delete_weight = 0;
         cfg.workload.read_weight = 0;
+        cfg.raft.read_mode = ReadMode::Log;
         for c in candidates() {
             assert!(
                 (c.apply)(&cfg).is_none(),

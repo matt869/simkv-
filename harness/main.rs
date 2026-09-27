@@ -15,7 +15,7 @@ use harness::replay::{replay, write_trace};
 use harness::shrink::{describe, shrink};
 use harness::sweep::{default_threads, sweep, SweepConfig};
 use harness::{run, SimConfig};
-use kvstore::raft::InjectedBug;
+use kvstore::raft::{InjectedBug, ReadMode};
 use simcore::trace::Level;
 use simcore::{MILLIS, SECONDS};
 use std::collections::BTreeMap;
@@ -52,7 +52,10 @@ COMMON OPTIONS:
                         constant compaction and snapshot transfer
     --bug NAME          Inject a deliberate defect, to prove the checkers see it:
                         ack-before-sync, commit-any-term, vote-before-sync,
-                        no-dedup, truncate-on-any-append
+                        no-dedup, truncate-on-any-append, read-without-quorum,
+                        read-before-term-commit
+    --reads MODE        index (default): ReadIndex, no log write per read;
+                        log: every read goes through the log
     --trace LEVEL       off | error | warn | info | debug (default off)
     --check-durability-every N
                         Events between disk-level durability sweeps (default 200;
@@ -250,6 +253,15 @@ fn config(args: &Args) -> SimConfig {
     }
     if args.has("no-liveness") {
         cfg.check_liveness = false;
+    }
+    if let Some(mode) = args.get("reads") {
+        match ReadMode::parse(mode) {
+            Some(m) => cfg.raft.read_mode = m,
+            None => {
+                eprintln!("error: --reads expects log or index, got {mode:?}");
+                std::process::exit(2);
+            }
+        }
     }
     if let Some(name) = args.get("bug") {
         match InjectedBug::parse(name) {

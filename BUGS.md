@@ -137,6 +137,8 @@ the control.
 | `vote-before-sync` — reveal a vote before it is durable | 268 of 300 | `durable_term_lost` |
 | `no-dedup` — retried requests apply twice | 288 of 300 | `linearizability` |
 | `truncate-on-any-append` — trust the leader's length | 300 of 300 | `commit_beyond_log` |
+| `read-without-quorum` — ReadIndex without confirming leadership | 8 of 300 | `stale_read_index` |
+| `read-before-term-commit` — ReadIndex before a current-term commit | 10 of 300 | `stale_read_index` |
 
 There is no longer a defect on this list the harness cannot see, and the test
 that asserts it is strict: no known-gap escape hatch.
@@ -330,15 +332,67 @@ Both seeds are now regression tests.
 
 ---
 
+## 8. ReadIndex, and a storm no checker could see
+
+Reads used to go through the log: correct, and a disk sync on a majority per
+read. ReadIndex (Raft §6.4) answers from the leader's memory instead, after
+confirming leadership with a round of probes. Two deliberate defects came with
+it, and building it turned up one real bug.
+
+### The workload could not see stale reads
+
+`read-without-quorum` — a leader that serves reads without confirming it is
+still leader — went uncaught in 400 seeds by the linearizability check. The
+reason was the workload, not the checker. Clients run one operation at a time.
+A client stranded on the minority side of a partition sends a write that can
+never commit, and waits on it for seconds. The stale reads a deposed leader
+serves happen in the first milliseconds of the partition, before the majority
+side has even elected anyone, so there is nothing yet for them to be stale
+against.
+
+The fix was the lesson from before: **check the rule, not the damage.** A read
+must observe everything committed anywhere in the cluster before it arrived.
+For a leader that has committed an entry of its own term and then confirmed
+itself with a majority, that is guaranteed — any leader that could have
+committed past it was elected by nodes that would have refused the
+confirmation. `stale_read_index` checks exactly that, and catches both read
+defects.
+
+### Bug 8: a message storm
+
+A fault-free sweep took four times longer with ReadIndex than without, despite
+running fewer events per seed. One seed was responsible: **580,183 events where
+about 24,000 is normal** — 245,000 `AppendEntries` and 245,000 replies.
+
+Installing a snapshot that matched the follower's own log kept the entries above
+it (the section 7 optimisation restored in bug 6) but threw away the follower's
+parked durability claims for those same entries. Those were claims for data
+already on disk, waiting only on a gap below them. With them gone, the
+follower's durable index stuck. It acknowledged the same point on every reply;
+the leader, seeing it behind, resent immediately; the follower had nothing new,
+so it replied immediately. The two went back and forth at network speed for
+the rest of the run.
+
+Every value stayed correct and every commit stayed durable, so **no checker
+fired. A stopwatch found it.** The fix keeps the claims for entries that
+survive the snapshot. And because this whole class of bug is invisible to
+safety checks, there is now one that is not: healthy runs cost about 15 events
+per completed operation — never more than 30, even in the harshest
+configuration — so a run above 40 per operation per server fails as
+`message_storm`. With the fix reverted, that check catches seed 200 at 360 per
+operation.
+
+---
+
 ## Current status
 
 ```
-7000 seeds across seven configurations → no failures
-  (default; --max-batch 2; 5 servers; majority-failure allowed;
-   --snapshot-threshold 3; 5 servers + threshold 10 + batch 2;
-   7 servers + threshold 5 + majority-failure allowed)
-2000 seeds across snapshot thresholds 3, 5, 10, 400, retain-tail on
-  → no failures
+10000 seeds across ten configurations → no failures, no false positives
+  (default; fault-free; reads through the log; --max-batch 2; 5 servers;
+   majority-failure allowed; --snapshot-threshold 3; 5 servers + threshold 10
+   + batch 2; 7 servers + threshold 5 + majority-failure; single node)
+All seven injected defects caught; the test that asserts it has no
+  known-gap escape hatch
 5000 seeds, 3-node cluster, crashes + partitions + clock skew + torn writes
   → 45.2M events, 2.4M operations checked, no failures
 ```

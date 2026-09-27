@@ -55,6 +55,14 @@ back, so a correct cluster has to demonstrably recover — otherwise "wedged" an
   memoised on (linearized set, state), with O(1) backtracking. Operations that
   never got an answer may be placed anywhere after their invocation, or nowhere
   at all, because a client that timed out genuinely does not know.
+- **The rules themselves, not just their consequences** — a follower may never
+  acknowledge more than it has synced; a leader may only commit onto an entry of
+  its own term; a read may never be served at an index below something already
+  committed. Waiting for the *damage* these cause needs a long run of bad luck;
+  checking the rule fires on the first offending event.
+- **Efficiency** — a message storm breaks no safety property, so nothing above
+  can see one. Healthy runs cost about 15 events per operation; a run far above
+  that fails as `message_storm`.
 
 ## Usage
 
@@ -69,7 +77,8 @@ sim demo                                            a tour of all of the above
 Useful knobs for reaching states the defaults do not: `--max-batch N` (small
 batches make followers acknowledge at an old-term index), `--snapshot-threshold
 N` (low values force constant compaction and snapshot transfer),
-`--quorum-loss`, and `--bug NAME`.
+`--reads log|index`, `--quorum-loss`, and `--bug NAME` (seven deliberate
+defects, every one of which the checkers catch).
 
 Exit status is 0 when nothing failed and 1 when something did, so a sweep drops
 straight into CI.
@@ -82,15 +91,23 @@ suspect.
 
 ## Scope
 
-The store implements leader election, log replication, linearizable reads
-through the log with `(client, seq)` deduplication so a retry cannot apply
-twice, and log compaction: snapshots go to two alternating files, and a
-follower that has fallen behind the compacted log is caught up with
-`InstallSnapshot`. The write-ahead file stays append-only, so compaction
-reclaims memory but not disk — doing that safely needs an atomic rename the
-storage model deliberately does not provide.
+The store implements leader election, log replication with `(client, seq)`
+deduplication so a retry cannot apply twice, and log compaction: snapshots go
+to two alternating files, and a follower that has fallen behind the compacted
+log is caught up with `InstallSnapshot`. The write-ahead file stays
+append-only, so compaction reclaims memory but not disk — doing that safely
+needs an atomic rename the storage model deliberately does not provide.
 
-Deliberately **not** implemented: membership changes and lease-based reads.
+Reads use **ReadIndex** (Raft §6.4) by default: the leader records its commit
+index, confirms it is still leader with one round of probes to a majority, and
+answers from memory once that index is applied — no log entry, no disk sync.
+Against putting every read through the log, that makes sweeps 2.1× faster on
+fault-free runs and 1.3× faster under faults, with a third fewer log entries.
+`--reads log` switches back.
+
+Deliberately **not** implemented: membership changes, and lease-based reads —
+which trade the probe round for a dependence on bounded clock drift, in a
+simulator that deliberately skews and steps every clock.
 
 ## Bugs found
 

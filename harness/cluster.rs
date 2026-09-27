@@ -23,7 +23,7 @@ use checker::invariants::{Invariants, NodeView};
 use checker::linearizability::{Checker, History, Verdict};
 use checker::{Report, Violation};
 use kvstore::log::{Entry, RaftLog};
-use kvstore::raft::{RaftMsg, Role};
+use kvstore::raft::{RaftMsg, ReadEvent, Role};
 use kvstore::{KvServer, Message};
 use sim_io::{SimIo, FILE_SNAPSHOT_A, FILE_SNAPSHOT_B, FILE_WAL};
 use simcore::faults::{FaultAction, FaultHint};
@@ -66,6 +66,9 @@ pub struct Cluster {
     /// match_index above it is proof the node acknowledged data it had never
     /// synced -- with no false positives.
     durable_high_water: Vec<u64>,
+    /// (node, read id) -> (its read index, the highest index committed anywhere
+    /// in the cluster when the read arrived).
+    pending_reads: BTreeMap<(NodeId, u64), (u64, u64)>,
 
     events: u64,
     incomplete: bool,
@@ -129,6 +132,7 @@ impl Cluster {
             empty_log: RaftLog::new(),
             truncated_committed_seen,
             durable_high_water: vec![0; cfg_servers],
+            pending_reads: BTreeMap::new(),
             events: 0,
             incomplete: false,
             finished: false,
@@ -151,6 +155,7 @@ impl Cluster {
                 break;
             }
             self.dispatch(fired);
+            self.check_reads();
             self.reap_failed();
             if self.events.is_multiple_of(self.cfg.check_every) {
                 self.check_invariants();
@@ -519,6 +524,60 @@ impl Cluster {
         node.idx() >= self.cfg.servers
     }
 
+    /// The ReadIndex rule, checked directly.
+    ///
+    /// A read must observe everything committed anywhere in the cluster before
+    /// it arrived. For a leader that has committed an entry of its own term and
+    /// then confirmed its leadership with a majority, that is guaranteed: no
+    /// other leader can have committed past it, because any such leader was
+    /// elected by nodes that would have refused the confirmation.
+    ///
+    /// The external linearizability check cannot see this reliably. Clients
+    /// run one operation at a time, and one stranded behind a partition spends
+    /// most of it waiting on a write that cannot commit -- so the stale reads a
+    /// broken leader serves mostly happen before the other side has committed
+    /// anything for them to be stale against.
+    ///
+    /// "Committed anywhere" is read from the invariant checker's record, which
+    /// reflects the cluster as of the previous event -- i.e. before this read
+    /// arrived, which is exactly the right moment.
+    fn check_reads(&mut self) {
+        let now = self.world.now();
+        let committed_before = self.invariants.max_committed();
+        for i in 0..self.cfg.servers {
+            let node = NodeId(i as u32);
+            let events = match self.servers[i].as_mut() {
+                Some(s) => s.raft.take_read_events(),
+                None => continue,
+            };
+            for ev in events {
+                match ev {
+                    ReadEvent::Requested { id, read_index } => {
+                        self.pending_reads
+                            .insert((node, id), (read_index, committed_before));
+                    }
+                    ReadEvent::Served { id } => {
+                        let Some((read_index, needed)) = self.pending_reads.remove(&(node, id))
+                        else {
+                            continue;
+                        };
+                        if read_index < needed {
+                            self.report.add(Violation::new(
+                                "stale_read_index",
+                                now,
+                                Some(node),
+                                format!(
+                                    "served a read at index {read_index}, but index {needed} \
+                                     had already been committed when the read arrived"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Verify every live node's durability claim against the bytes that would
     /// actually survive a power cut.
     fn check_durable_claims(&mut self) {
@@ -651,6 +710,36 @@ impl Cluster {
             self.cfg.servers,
         ));
 
+        // Efficiency. A storm of messages that makes no progress breaks no
+        // safety property -- every value stays right, every commit stays
+        // durable -- so nothing above can see it. The first one found here was
+        // noticed by a stopwatch: one seed ran 90 times slower than the rest.
+        //
+        // Healthy runs are remarkably consistent: about 15 events per completed
+        // operation, never more than 30 even with five nodes, a snapshot every
+        // three entries and two-entry batches. The bound below is scaled by
+        // cluster size, because messages are, and leaves several times that
+        // headroom. It is only applied once enough work has completed for the
+        // ratio to mean something; a run that barely progressed is the
+        // liveness check's business.
+        let completed = self.history.completed() as u64;
+        if self.cfg.check_efficiency && !self.incomplete && completed >= 100 {
+            let per_op = self.events / completed;
+            let bound = 40 * self.cfg.servers.max(1) as u64;
+            if per_op > bound {
+                self.report.add(Violation::new(
+                    "message_storm",
+                    now,
+                    None,
+                    format!(
+                        "{} events for {completed} completed operations ({per_op} per operation; \
+                         a healthy run of this size stays under {bound})",
+                        self.events
+                    ),
+                ));
+            }
+        }
+
         // Liveness: after everything healed, the cluster had to get back to
         // work. A wedged cluster is a bug even if it never says anything wrong.
         if self.cfg.check_liveness && !self.incomplete && !self.clients.is_empty() {
@@ -716,6 +805,12 @@ impl Cluster {
             .iter()
             .flatten()
             .map(|s| s.stats().bad_messages)
+            .sum();
+        self.stats.index_reads = self
+            .servers
+            .iter()
+            .flatten()
+            .map(|s| s.stats().index_reads)
             .sum();
         let net = self.world.net_stats();
         self.stats.messages_sent = net.sent;

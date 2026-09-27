@@ -49,6 +49,10 @@ pub struct SimConfig {
     /// are far more expensive than the in-memory invariants.
     pub check_durability_every: u64,
     pub check_liveness: bool,
+    /// Flag runs that burn far more events per operation than any healthy run
+    /// does. Catches livelocks and message storms, which break no safety
+    /// property and so are invisible to every other check.
+    pub check_efficiency: bool,
     pub linearizability_budget: u64,
     pub net: NetConfig,
     pub disk: DiskConfig,
@@ -80,6 +84,7 @@ impl Default for SimConfig {
             check_every: 1,
             check_durability_every: 200,
             check_liveness: true,
+            check_efficiency: true,
             linearizability_budget: checker::linearizability::DEFAULT_BUDGET,
             net: NetConfig::hostile(),
             disk: DiskConfig::hostile(),
@@ -150,6 +155,8 @@ pub struct RunStats {
     pub messages_dropped: u64,
     pub bad_messages: u64,
     pub linearizability_steps: u64,
+    /// Reads answered through ReadIndex rather than through the log.
+    pub index_reads: u64,
 }
 
 /// The result of one run.
@@ -184,11 +191,12 @@ impl RunOutcome {
     pub fn summary(&self) -> String {
         let s = &self.stats;
         format!(
-            "seed {:>6} | {:>5} ops ({} abandoned) | {} committed | {} elections, {} leaders | \
-             {} crashes, {} partitions | {} events | fp {} | {}",
+            "seed {:>6} | {:>5} ops ({} abandoned, {} index reads) | {} committed | \
+             {} elections, {} leaders | {} crashes, {} partitions | {} events | fp {} | {}",
             self.seed,
             s.ops_completed,
             s.ops_abandoned,
+            s.index_reads,
             s.max_committed,
             s.elections,
             s.leaders_elected,
@@ -247,6 +255,66 @@ mod tests {
             out.stats.ops_completed
         );
         assert!(out.stats.leaders_elected >= 1, "someone has to lead");
+    }
+
+    #[test]
+    fn a_follower_keeps_its_durability_claims_across_a_matching_snapshot() {
+        // Regression: installing a snapshot that matched the follower's log
+        // threw away its parked durability claims for the entries it kept. Its
+        // durable index stuck, it acknowledged the same point forever, and the
+        // leader resent forever -- 580,000 events where 24,000 was normal. No
+        // safety property broke, so only the efficiency check can see it.
+        let out = run(SimConfig::benign(200));
+        assert!(!out.failed(), "{}", out.detail());
+        assert!(
+            out.stats.events < 60_000,
+            "expected a normal event count, got {}",
+            out.stats.events
+        );
+    }
+
+    #[test]
+    fn reads_bypass_the_log_by_default() {
+        // ReadIndex is the default: reads are answered from memory after a
+        // leadership check, so the log carries writes only.
+        let index = run(SimConfig::benign(3));
+        assert!(!index.failed(), "{}", index.detail());
+        assert!(
+            index.stats.index_reads > 20,
+            "expected reads served through ReadIndex, got {}",
+            index.stats.index_reads
+        );
+
+        let mut log_cfg = SimConfig::benign(3);
+        log_cfg.raft.read_mode = kvstore::raft::ReadMode::Log;
+        let log = run(log_cfg);
+        assert!(!log.failed(), "{}", log.detail());
+        assert_eq!(log.stats.index_reads, 0, "log mode must not use ReadIndex");
+        assert!(
+            log.stats.max_committed > index.stats.max_committed,
+            "putting reads in the log should make it longer ({} vs {})",
+            log.stats.max_committed,
+            index.stats.max_committed
+        );
+    }
+
+    #[test]
+    fn read_index_stays_linearizable_under_faults() {
+        // The same hostile world as every other sweep, with reads served from
+        // memory: partitions strand leaders, and none of them may answer.
+        for seed in 1..=6 {
+            let mut cfg = SimConfig::with_seed(seed);
+            cfg.duration = 6 * SECONDS;
+            cfg.settle = 10 * SECONDS;
+            cfg.drain = 3 * SECONDS;
+            cfg.normalise();
+            let out = run(cfg);
+            assert!(!out.failed(), "{}", out.detail());
+            assert!(
+                out.stats.index_reads > 0,
+                "seed {seed} served no index reads"
+            );
+        }
     }
 
     #[test]
