@@ -133,15 +133,39 @@ the control.
 | Defect | Detection | Caught by |
 |---|---|---|
 | `ack-before-sync` — acknowledge before `fsync` | 300 of 300 | `ack_beyond_durable` |
-| `commit-any-term` — Raft Figure 8 | 156 of 300 | `commit_of_foreign_term` |
-| `vote-before-sync` — reveal a vote before it is durable | 268 of 300 | `durable_term_lost` |
-| `no-dedup` — retried requests apply twice | 288 of 300 | `linearizability` |
+| `commit-any-term` — Raft Figure 8 | 216 of 300 | `commit_of_foreign_term` |
+| `vote-before-sync` — reveal a vote before it is durable | 142 of 300 | `vote_beyond_durable` |
+| `no-dedup` — retried requests apply twice | 299 of 300 | `linearizability` |
 | `truncate-on-any-append` — trust the leader's length | 300 of 300 | `commit_beyond_log` |
-| `read-without-quorum` — ReadIndex without confirming leadership | 8 of 300 | `stale_read_index` |
-| `read-before-term-commit` — ReadIndex before a current-term commit | 10 of 300 | `stale_read_index` |
+| `read-without-quorum` — ReadIndex without confirming leadership | 17 of 300 | `stale_read_index` |
+| `read-before-term-commit` — ReadIndex before a current-term commit | 21 of 300 | `stale_read_index` |
+| `config-before-term-commit` — change membership before a current-term commit | 31 of 400 (`--reconfig`) | `config_before_term_commit` |
 
 There is no longer a defect on this list the harness cannot see, and the test
-that asserts it is strict: no known-gap escape hatch.
+that asserts it is strict: no known-gap escape hatch, and — since the
+correction below — a stall does not count as a catch.
+
+### Correction: `vote-before-sync` had stopped being a defect
+
+This table used to say `vote-before-sync` was caught in 268 of 300 seeds by
+`durable_term_lost`. That was measured before bug 2 was fixed, and was never
+measured again. Bug 2's fix is a guard on every send: no message may carry a
+term that is not yet durable. The injected defect sent its early vote through
+that same guard — which dropped it. From then on the "defect" was an election
+that could never finish, and sweeps caught it as `no_progress_after_recovery`
+in 231 of 300 seeds, while the bug it claims to model was never exercised at
+all. The test only asked that *something* fail, so it went on passing.
+
+Two changes. The defect now goes around the guard, so the vote really does
+leave before it is durable; damage-based detection then managed 20 of 300. And
+a new rule check, `vote_beyond_durable`, reads the voter's stable storage on
+every granted vote it sees — the vote, or a later term, must already be there —
+which takes it to 142 of 300. `every_injected_bug_is_caught` now also rejects a
+catch that is only a stall: every defect on this list breaks a safety property,
+and has to be caught by one.
+
+The leader-bias figures below ("from 5 seeds in 300 to 268") date from before
+the guard and are kept as they were measured.
 
 ### Check the rule, not just the damage
 
@@ -384,17 +408,80 @@ operation.
 
 ---
 
+## 9. Membership changes, and three bugs they shook loose
+
+Single-server membership changes (thesis §4.1) went in with two rule checks of
+their own: `config_before_term_commit` (a leader changed the membership before
+committing an entry of its own term — the bug in the original single-server
+algorithm, fixed on raft-dev in 2015) and `concurrent_config_change` (a second
+change proposed while one is still uncommitted). The matching defect,
+`config-before-term-commit`, is caught in 31 of 400 reconfiguring seeds.
+
+### A removed server that never finds out
+
+A leader removes a server and commits the change without it — that is the
+point of removing it. The removed server never receives the entry, never learns
+it is out, times out, and campaigns. Its higher term deposes the working leader;
+the cluster elects a new one; the removed server times out again. In seed 2 it
+started 36 elections.
+
+The fix is leader stickiness (thesis §4.2.3): a server that has heard from a
+leader within the minimum election timeout ignores vote requests, even at
+higher terms. `--no-stickiness` turns it off, which makes the effect
+measurable: over 400 reconfiguring seeds, 213,320 operations complete without
+it and 247,971 with it. Seed 2 alone goes from 331 operations, 44 elections and
+5 leaders to 588 operations.
+
+### Bug 9: a term learned from a snapshot never reached disk
+
+Seed 392 (`--reconfig --snapshot-threshold 5 --max-batch 2`): a follower
+restarted at term 15, and the first message it got from the term-17 leader was
+`InstallSnapshot`. That handler adopted the term in memory with the plain
+`step_down`, not `step_down_and_persist` — and nothing in the install path
+writes the hard state, because the snapshot goes to its own file. Term 17 was
+never durable, so bug 2's send guard withheld every reply the follower owed the
+leader, for good. The leader kept retrying, the retries kept the follower's
+election timer quiet, and the cluster stalled with a live leader and a live
+quorum: `no_progress_after_recovery`, 240 operations instead of 1199.
+
+The same hole was in `AppendEntries`: an append falling entirely below the
+snapshot returned early with a reply, skipping the hard-state write that the
+rest of the handler does. Both now persist the term first.
+
+This is not a membership bug. It needed a restart, a snapshot as the very first
+contact, and a term jump — and adding servers mid-run changed the schedules
+enough to produce that combination. Nothing about the code path was new.
+
+### Bug 10: a repeated vote, granted from memory
+
+Found by `vote_beyond_durable` the first time it ran, at seed 480 under
+`--reconfig`. A node with term 8 already durable granted n4 its vote and began
+writing it. The network duplicated n4's request; the copy arrived while the
+write was in flight. By then nothing was "dirty" — the vote was already in
+memory — so the handler answered at once, and the send guard, which checks
+terms and not votes, let it out. A crash before the sync would bring the node
+back with no vote in term 8, free to elect a second leader in it.
+
+Raft now tracks the newest hard state actually on disk, not just its term, and
+does not repeat a grant until that vote is there; the write in flight sends the
+answer when it lands. No damage-based check had ever reported this, across tens
+of thousands of seeds — a duplicate, a crash, and a competing candidate all in
+one window is a long coincidence. The rule check saw it on its first sweep.
+
+---
+
 ## Current status
 
 ```
-10000 seeds across ten configurations → no failures, no false positives
-  (default; fault-free; reads through the log; --max-batch 2; 5 servers;
-   majority-failure allowed; --snapshot-threshold 3; 5 servers + threshold 10
-   + batch 2; 7 servers + threshold 5 + majority-failure; single node)
-All seven injected defects caught; the test that asserts it has no
-  known-gap escape hatch
-5000 seeds, 3-node cluster, crashes + partitions + clock skew + torn writes
-  → 45.2M events, 2.4M operations checked, no failures
+16500 seeds across eleven configurations → no failures, no false positives
+  (default; fault-free; --snapshot-threshold 5 + batch 2; 5 servers +
+   threshold 3; 7 servers; and with membership changes: default, 5 servers,
+   threshold 5 + batch 2, majority-failure, reads through the log,
+   no stickiness)
+All eight injected defects caught, every one by a safety rule rather than a
+  stall; the test that asserts it has no known-gap escape hatch
+3000 seeds adding and removing servers under crashes + partitions + clock
+  skew + torn writes → 59.2M events, 2.8M operations checked, no failures
 ```
 
 Absence of failures is not proof of correctness. It means the bugs that remain

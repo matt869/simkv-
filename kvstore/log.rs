@@ -60,12 +60,18 @@ pub enum Op {
         expect: Option<String>,
         value: String,
     },
+    /// A membership change. Takes effect on each server the moment it is in
+    /// that server's log -- committed or not -- which is what makes changing
+    /// one server at a time safe without a joint-consensus phase.
+    SetMembers {
+        members: Vec<NodeId>,
+    },
 }
 
 impl Op {
     pub fn key(&self) -> Option<&str> {
         match self {
-            Op::Noop => None,
+            Op::Noop | Op::SetMembers { .. } => None,
             Op::Get { key } | Op::Put { key, .. } | Op::Delete { key } | Op::Cas { key, .. } => {
                 Some(key)
             }
@@ -93,6 +99,12 @@ impl Op {
             Op::Cas { key, expect, value } => {
                 e.u8(4).str(key).opt_str(expect.as_deref()).str(value);
             }
+            Op::SetMembers { members } => {
+                e.u8(5).u32(members.len() as u32);
+                for m in members {
+                    e.u32(m.0);
+                }
+            }
         }
     }
 
@@ -110,6 +122,17 @@ impl Op {
                 expect: d.opt_string()?,
                 value: d.string()?,
             },
+            5 => {
+                let n = d.u32()? as usize;
+                if n == 0 || n > 256 {
+                    return Err(DecodeError::TooLong);
+                }
+                let mut members = Vec::with_capacity(n);
+                for _ in 0..n {
+                    members.push(NodeId(d.u32()?));
+                }
+                Op::SetMembers { members }
+            }
             t => return Err(DecodeError::BadTag(t)),
         })
     }
@@ -135,6 +158,14 @@ impl Command {
 
     pub fn is_noop(&self) -> bool {
         matches!(self.op, Op::Noop)
+    }
+
+    /// The membership this entry installs, if it is a membership change.
+    pub fn members(&self) -> Option<&[NodeId]> {
+        match &self.op {
+            Op::SetMembers { members } => Some(members),
+            _ => None,
+        }
     }
 
     pub fn encode_into(&self, e: &mut Enc) {

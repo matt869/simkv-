@@ -30,7 +30,7 @@
 use crate::codec::{Dec, DecodeError, Enc};
 use crate::log::{
     pick_snapshot_with_source, recover_hard_state, recover_log_any_start, Command, Entry,
-    HardState, RaftLog, Snapshot, NO_INDEX, SLOT_SIZE, STATE_FILE_SIZE,
+    HardState, Op, RaftLog, Snapshot, NO_INDEX, SLOT_SIZE, STATE_FILE_SIZE,
 };
 use crate::Message;
 use sim_io::storage::{FILE_SNAPSHOT_A, FILE_SNAPSHOT_B, FILE_WAL};
@@ -43,6 +43,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// The log begins after the two hard-state slots.
 pub const LOG_REGION: usize = STATE_FILE_SIZE;
+
+/// The client identity carried by membership entries. They are Raft's own and
+/// belong to no session.
+pub const CONFIG_CLIENT: u32 = u32::MAX - 1;
 
 pub const TIMER_ELECTION: TimerTag = 1;
 pub const TIMER_HEARTBEAT: TimerTag = 2;
@@ -79,10 +83,15 @@ pub enum InjectedBug {
     /// own term. Until it has, its commit index can lag what an earlier leader
     /// already committed and acknowledged.
     ReadBeforeTermCommit,
+    /// Propose a membership change before committing an entry of this term.
+    /// This is the bug in the original single-server algorithm, found in 2015:
+    /// two leaders' uncommitted changes can leave majorities that do not
+    /// overlap, and two leaders in one term.
+    ConfigBeforeTermCommit,
 }
 
 impl InjectedBug {
-    pub const ALL: [InjectedBug; 7] = [
+    pub const ALL: [InjectedBug; 8] = [
         InjectedBug::AckBeforeSync,
         InjectedBug::CommitAnyTerm,
         InjectedBug::VoteBeforeSync,
@@ -90,6 +99,7 @@ impl InjectedBug {
         InjectedBug::TruncateOnAnyAppend,
         InjectedBug::ReadWithoutQuorum,
         InjectedBug::ReadBeforeTermCommit,
+        InjectedBug::ConfigBeforeTermCommit,
     ];
 
     pub fn name(self) -> &'static str {
@@ -102,6 +112,7 @@ impl InjectedBug {
             InjectedBug::TruncateOnAnyAppend => "truncate-on-any-append",
             InjectedBug::ReadWithoutQuorum => "read-without-quorum",
             InjectedBug::ReadBeforeTermCommit => "read-before-term-commit",
+            InjectedBug::ConfigBeforeTermCommit => "config-before-term-commit",
         }
     }
 
@@ -136,6 +147,9 @@ impl InjectedBug {
             InjectedBug::ReadWithoutQuorum => "serves reads without confirming leadership",
             InjectedBug::ReadBeforeTermCommit => {
                 "serves reads before committing an entry of its own term"
+            }
+            InjectedBug::ConfigBeforeTermCommit => {
+                "changes membership before committing an entry of its own term"
             }
         }
     }
@@ -202,6 +216,11 @@ pub struct RaftConfig {
     pub snapshot_threshold: u64,
     /// How reads are served.
     pub read_mode: ReadMode,
+    /// Ignore a vote request that arrives within the minimum election timeout
+    /// of hearing from a leader (Raft thesis 4.2.3). Without it, a server that
+    /// was removed from the cluster but never heard about it times out forever,
+    /// forcing an election with a higher term every few hundred milliseconds.
+    pub leader_stickiness: bool,
     /// A deliberate defect, for verifying that the checkers work.
     pub bug: InjectedBug,
 }
@@ -214,6 +233,7 @@ impl Default for RaftConfig {
             max_batch: 64,
             snapshot_threshold: 400,
             read_mode: ReadMode::ReadIndex,
+            leader_stickiness: true,
             bug: InjectedBug::None,
         }
     }
@@ -509,9 +529,9 @@ struct Batch {
     writes_outstanding: usize,
     sync_issued: bool,
     action: Persist,
-    /// The term written to the hard-state slot in this batch, if any. Once the
-    /// batch syncs, that term is on stable storage.
-    hard_term: Option<u64>,
+    /// The hard state written in this batch, if any. Once the batch syncs, that
+    /// term -- and that vote -- are on stable storage.
+    hard: Option<HardState>,
 }
 
 /// Sequences `write -> confirm -> fsync -> confirm` for a group of writes that
@@ -533,7 +553,7 @@ enum BatchEvent {
     NeedSync(u64, FileId),
     Done {
         action: Persist,
-        hard_term: Option<u64>,
+        hard: Option<HardState>,
     },
     Failed,
 }
@@ -547,7 +567,7 @@ impl Persister {
             writes_outstanding: 0,
             sync_issued: false,
             action,
-            hard_term: None,
+            hard: None,
         });
         self.next_id
     }
@@ -570,10 +590,10 @@ impl Persister {
         }
     }
 
-    /// Record that this batch writes the hard state carrying `term`.
-    fn note_hard_state(&mut self, id: u64, term: u64) {
+    /// Record that this batch writes `hs` to a hard-state slot.
+    fn note_hard_state(&mut self, id: u64, hs: HardState) {
         if let Some(b) = self.batch(id) {
-            b.hard_term = Some(term);
+            b.hard = Some(hs);
         }
     }
 
@@ -611,7 +631,7 @@ impl Persister {
                 let b = self.batches.remove(i);
                 BatchEvent::Done {
                     action: b.action,
-                    hard_term: b.hard_term,
+                    hard: b.hard,
                 }
             }
         }
@@ -646,6 +666,10 @@ pub struct RaftStats {
     /// Reads started through ReadIndex, and probe rounds sent for them.
     pub reads_requested: u64,
     pub read_probes_sent: u64,
+    /// Membership changes this node proposed as leader.
+    pub config_changes: u64,
+    /// Vote requests ignored because a leader had been heard from recently.
+    pub votes_ignored: u64,
 }
 
 /// What happened to a ReadIndex read, for the checker.
@@ -655,6 +679,34 @@ pub enum ReadEvent {
     Requested { id: u64, read_index: u64 },
     /// Answered from the state machine.
     Served { id: u64 },
+}
+
+/// Wrap the application's snapshot with the membership in force at its index.
+///
+/// Raft owns the membership and the application owns its state; the envelope
+/// keeps them in one durable image without either reaching into the other.
+fn encode_snapshot_payload(members: &[NodeId], app: &[u8]) -> Vec<u8> {
+    let mut e = Enc::new();
+    e.u32(members.len() as u32);
+    for m in members {
+        e.u32(m.0);
+    }
+    e.bytes(app);
+    e.into_vec()
+}
+
+fn decode_snapshot_payload(bytes: &[u8]) -> Option<(Vec<NodeId>, Vec<u8>)> {
+    let mut d = Dec::new(bytes);
+    let n = d.u32().ok()? as usize;
+    if n > 256 {
+        return None;
+    }
+    let mut members = Vec::with_capacity(n);
+    for _ in 0..n {
+        members.push(NodeId(d.u32().ok()?));
+    }
+    let app = d.bytes().ok()?.to_vec();
+    Some((members, app))
 }
 
 /// A read waiting for its leadership confirmation and for the state machine to
@@ -723,6 +775,16 @@ pub struct Raft {
     /// landed yet. Stops an older snapshot being written over a newer one when
     /// the network delivers them out of order.
     highest_snapshot: u64,
+    /// The membership used when neither the log nor a snapshot says otherwise.
+    initial_members: Vec<NodeId>,
+    /// The membership as of the snapshot, for when the entry that set it has
+    /// been compacted away.
+    snapshot_members: Vec<NodeId>,
+    /// Index of the latest membership entry in the log; zero if the current
+    /// membership comes from the snapshot or the initial configuration.
+    config_index: u64,
+    /// When this node last heard from a leader, on its own clock.
+    last_leader_contact: Nanos,
     /// Monotonic probe round counter for ReadIndex.
     read_seq: u64,
     pending_reads: Vec<PendingRead>,
@@ -736,6 +798,10 @@ pub struct Raft {
     /// term that a crash could forget is how a node ends up acting twice in the
     /// same term.
     durable_term: u64,
+    /// The newest hard state known to be on stable storage. The term alone is
+    /// not enough to guard a vote: a node can hold its term durably and still
+    /// have the vote it cast in that term sitting in the page cache.
+    durable_hard_state: HardState,
 
     persister: Persister,
     election_timer: Deadline,
@@ -754,10 +820,8 @@ impl Raft {
         cfg: RaftConfig,
         seed: u64,
     ) -> Raft {
-        assert!(
-            members.contains(&id),
-            "a node must be a member of its cluster"
-        );
+        // A node need not be in the membership it starts with: a spare waits
+        // outside the cluster until a membership change adds it.
         let bytes = io.read_all(FILE_WAL);
         let hs = recover_hard_state(&bytes);
 
@@ -842,6 +906,16 @@ impl Raft {
         let damaged = recovered.damaged || dropped_ahead_of_term > 0 || spliced || stale_region;
 
         let durable_index = log.last_index();
+        let initial_members = members.clone();
+        // The snapshot carries the membership as of its index, wrapped around
+        // the application's image.
+        let (snapshot_members, restore_blob) = match restore_blob {
+            Some(payload) => match decode_snapshot_payload(&payload) {
+                Some((m, app)) => (m, Some(app)),
+                None => (Vec::new(), None),
+            },
+            None => (Vec::new(), None),
+        };
         let mut raft = Raft {
             id,
             members,
@@ -868,6 +942,11 @@ impl Raft {
             highest_snapshot: snap_index,
             state_seq: hs.seq + 1,
             durable_term: hs.term,
+            durable_hard_state: hs,
+            initial_members,
+            snapshot_members,
+            config_index: 0,
+            last_leader_contact: 0,
             read_seq: 0,
             pending_reads: Vec::new(),
             probe_acked: BTreeMap::new(),
@@ -879,6 +958,7 @@ impl Raft {
             failed: false,
             stats: RaftStats::default(),
         };
+        raft.refresh_config();
         raft.observe_state(io, "recover");
         io.trace(
             Level::Info,
@@ -948,6 +1028,27 @@ impl Raft {
     }
     pub fn persists_in_flight(&self) -> usize {
         self.persister.in_flight()
+    }
+
+    /// Votes from servers in the current membership. A vote from anyone else
+    /// counts for nothing -- a removed server still answering vote requests
+    /// must not help elect a leader of a cluster it is no longer in.
+    fn heard_from_leader_recently(&self, io: &dyn Io) -> bool {
+        if !self.cfg.leader_stickiness {
+            return false;
+        }
+        if self.role == Role::Leader {
+            return true;
+        }
+        self.leader.is_some()
+            && io.now().saturating_sub(self.last_leader_contact) < self.cfg.election_timeout.0
+    }
+
+    fn member_votes(&self) -> usize {
+        self.votes
+            .iter()
+            .filter(|v| self.members.contains(v))
+            .count()
     }
 
     fn quorum(&self) -> usize {
@@ -1030,6 +1131,12 @@ impl Raft {
                 if self.role == Role::Leader {
                     return;
                 }
+                if !self.is_member() {
+                    // Not part of the cluster -- a spare, or removed. Keep
+                    // listening, never campaign.
+                    self.reset_election_timer(io);
+                    return;
+                }
                 self.become_candidate(io);
             }
             TIMER_HEARTBEAT => {
@@ -1070,12 +1177,15 @@ impl Raft {
                 let sync_op = io.sync(file);
                 self.persister.note_sync(id, sync_op);
             }
-            BatchEvent::Done { action, hard_term } => {
+            BatchEvent::Done { action, hard } => {
                 // The term reached stable storage with this sync, so messages
                 // carrying it may now be sent.
-                if let Some(t) = hard_term {
-                    if t > self.durable_term {
-                        self.durable_term = t;
+                if let Some(hs) = hard {
+                    if hs.seq >= self.durable_hard_state.seq {
+                        self.durable_hard_state = hs;
+                    }
+                    if hs.term > self.durable_term {
+                        self.durable_term = hs.term;
                         // Entries held back for want of a durable term may now
                         // be claimable.
                         self.advance_durable(io);
@@ -1119,6 +1229,160 @@ impl Raft {
             }
         }
         out
+    }
+
+    // ---- membership --------------------------------------------------------
+
+    /// The membership this node is using now: the latest in its log, committed
+    /// or not.
+    pub fn members(&self) -> &[NodeId] {
+        &self.members
+    }
+
+    pub fn is_member(&self) -> bool {
+        self.members.contains(&self.id)
+    }
+
+    /// Index of the latest membership entry in the log, or zero.
+    pub fn config_index(&self) -> u64 {
+        self.config_index
+    }
+
+    fn base_config(&self) -> Vec<NodeId> {
+        if self.snapshot_members.is_empty() {
+            self.initial_members.clone()
+        } else {
+            self.snapshot_members.clone()
+        }
+    }
+
+    /// The membership in force at `index`, and the index of the entry that set
+    /// it (zero if it came from the snapshot or the initial configuration).
+    fn config_at(&self, index: u64) -> (Vec<NodeId>, u64) {
+        let mut i = index.min(self.log.last_index());
+        while i >= self.log.first_index() && i > 0 {
+            if let Some(m) = self.log.get(i).and_then(|e| e.cmd.members()) {
+                return (m.to_vec(), i);
+            }
+            i -= 1;
+        }
+        (self.base_config(), 0)
+    }
+
+    /// Recompute the membership after anything that changed the log.
+    ///
+    /// Called on every path that can add or remove a membership entry --
+    /// appending one, truncating one away, compacting past one, installing a
+    /// snapshot -- because a server uses the latest configuration in its log
+    /// the moment it is there, and reverts the moment it is gone.
+    fn refresh_config(&mut self) {
+        let (members, index) = self.config_at(self.log.last_index());
+        self.members = members;
+        self.config_index = index;
+        if self.role == Role::Leader {
+            self.sync_peer_maps();
+        }
+    }
+
+    /// Keep the leader's replication state in step with the membership.
+    fn sync_peer_maps(&mut self) {
+        let next = self.log.last_index() + 1;
+        let peers = self.peers();
+        for p in &peers {
+            self.next_index.entry(*p).or_insert(next);
+            self.match_index.entry(*p).or_insert(NO_INDEX);
+        }
+        self.next_index.retain(|p, _| peers.contains(p));
+        self.match_index.retain(|p, _| peers.contains(p));
+    }
+
+    /// Propose adding or removing exactly one server.
+    ///
+    /// Two preconditions, both from the Raft thesis and both load-bearing:
+    ///
+    /// * **One change at a time.** The previous membership entry must be
+    ///   committed. Any majority of a configuration and any majority of one
+    ///   that differs by a single server overlap; two changes in flight break
+    ///   that.
+    /// * **An entry of this term is committed.** The original algorithm
+    ///   missed this, and it was found in 2015: a new leader can still hold a
+    ///   previous leader's *uncommitted* change, propose its own on top, and
+    ///   the two differ by two servers after all. Committing the new leader's
+    ///   no-op first settles which of the earlier changes survived.
+    pub fn propose_membership(
+        &mut self,
+        io: &mut dyn Io,
+        mut members: Vec<NodeId>,
+    ) -> Result<u64, &'static str> {
+        if self.role != Role::Leader || self.failed {
+            return Err("not the leader");
+        }
+        if self.log.term_at(self.commit_index) != Some(self.term)
+            && self.cfg.bug != InjectedBug::ConfigBeforeTermCommit
+        {
+            return Err("no entry of this term committed yet");
+        }
+        if self.config_index > self.commit_index {
+            return Err("a membership change is already in progress");
+        }
+        members.sort();
+        members.dedup();
+        if members.is_empty() {
+            return Err("a cluster needs at least one member");
+        }
+        let added = members.iter().filter(|m| !self.members.contains(m)).count();
+        let removed = self.members.iter().filter(|m| !members.contains(m)).count();
+        if added + removed != 1 {
+            return Err("change exactly one server at a time");
+        }
+        let index = self.log.last_index() + 1;
+        self.log.append(Entry {
+            term: self.term,
+            index,
+            cmd: Command {
+                client: CONFIG_CLIENT,
+                seq: index,
+                op: Op::SetMembers {
+                    members: members.clone(),
+                },
+            },
+        });
+        io.trace(
+            Level::Info,
+            "raft",
+            format!(
+                "proposing membership {:?} at index {index}",
+                members.iter().map(|n| n.0).collect::<Vec<_>>()
+            ),
+        );
+        io.observe("config", &[index, members.len() as u64]);
+        self.refresh_config();
+        self.stats.config_changes += 1;
+        self.persist_log_from(io, index, false, None, 0, u64::MAX);
+        self.broadcast_append(io);
+        Ok(index)
+    }
+
+    /// A leader that has removed itself steps aside once the change commits.
+    ///
+    /// Until then it goes on managing a cluster it is not counted in -- it has
+    /// to, because nobody else will replicate the entry that removes it.
+    fn step_aside_if_removed(&mut self, io: &mut dyn Io) {
+        if self.role == Role::Leader && !self.is_member() && self.config_index <= self.commit_index
+        {
+            io.trace(
+                Level::Info,
+                "raft",
+                format!(
+                    "stepping aside: removed from the cluster at index {}",
+                    self.config_index
+                ),
+            );
+            io.observe("step_aside", &[self.term]);
+            self.role = Role::Follower;
+            self.leader = None;
+            self.heartbeat_timer.disarm(io);
+        }
     }
 
     // ---- ReadIndex ---------------------------------------------------------
@@ -1241,6 +1505,7 @@ impl Raft {
             // which comes with the next heartbeat.
             self.step_down_and_persist(io, term);
             self.leader = Some(leader);
+            self.last_leader_contact = io.now();
             return;
         }
         if self.role == Role::Leader {
@@ -1253,6 +1518,7 @@ impl Raft {
             self.votes.clear();
         }
         self.leader = Some(leader);
+        self.last_leader_contact = io.now();
         self.reset_election_timer(io);
         self.send(io, from, RaftMsg::ReadProbeResp { term, seq });
     }
@@ -1268,9 +1534,18 @@ impl Raft {
         let acked = self.probe_acked.entry(from).or_insert(0);
         *acked = (*acked).max(seq);
         let quorum = self.quorum();
+        // Only acknowledgements from current members count, and this node only
+        // counts itself if it is one: a leader managing its own removal cannot
+        // vouch for itself.
+        let own = usize::from(self.is_member());
+        let members = &self.members;
         for r in self.pending_reads.iter_mut().filter(|r| !r.confirmed) {
-            let votes = 1 + self.probe_acked.values().filter(|a| **a >= r.seq).count();
-            if votes >= quorum {
+            let acks = self
+                .probe_acked
+                .iter()
+                .filter(|(n, a)| members.contains(n) && **a >= r.seq)
+                .count();
+            if own + acks >= quorum {
                 r.confirmed = true;
             }
         }
@@ -1319,6 +1594,14 @@ impl Raft {
             );
             return;
         }
+        if term > self.term && self.heard_from_leader_recently(io) {
+            // Someone is campaigning while this node is still hearing from a
+            // perfectly good leader: most likely a server that was removed and
+            // never found out, timing out forever. Neither adopt its term nor
+            // vote for it -- either would depose a working leader for nothing.
+            self.stats.votes_ignored += 1;
+            return;
+        }
         let mut dirty = false;
         if term > self.term {
             self.step_down(io, term);
@@ -1353,15 +1636,34 @@ impl Raft {
         } else if dirty {
             // The defect: the vote is written, but announced without waiting
             // for it to reach the platter.
+            //
+            // It has to go around the send guard to do that. Through `send`,
+            // the guard dropped the reply on the floor, and for a long while
+            // this "defect" was really an election that never finished: the
+            // sweeps caught it, but as a liveness failure, while the bug it
+            // claims to model went untested.
             let batch = self.persister.start(Persist::Quiet);
             self.write_hard_state(io, batch);
-            self.send(
-                io,
-                from,
-                RaftMsg::RequestVoteResp {
-                    term: self.term,
-                    granted,
-                },
+            let msg = RaftMsg::RequestVoteResp {
+                term: self.term,
+                granted,
+            };
+            io.send(from, &Message::Raft(msg).encode());
+        } else if granted
+            && (self.durable_hard_state.term != self.term
+                || self.durable_hard_state.voted_for != Some(candidate))
+        {
+            // A repeat of a request this node has already granted, arriving
+            // while that vote is still on its way to disk. Nothing is dirty --
+            // the vote is already in memory -- so this used to answer at once,
+            // and the term-only send guard let it through: the term had been
+            // durable for a while, the vote had not. A crash then brought the
+            // node back with no vote in a term it had already voted in. The
+            // write in flight answers when it lands; say nothing until then.
+            io.trace(
+                Level::Debug,
+                "raft",
+                format!("not repeating vote for {candidate}: it is not durable yet"),
             );
         } else {
             self.send(
@@ -1385,7 +1687,7 @@ impl Raft {
         }
         if granted {
             self.votes.insert(from);
-            if self.votes.len() >= self.quorum() {
+            if self.member_votes() >= self.quorum() {
                 self.become_leader(io);
             }
         }
@@ -1496,6 +1798,7 @@ impl Raft {
             self.heartbeat_timer.disarm(io);
         }
         self.leader = Some(leader);
+        self.last_leader_contact = io.now();
         self.reset_election_timer(io);
 
         let last_new_index = prev_index + entries.len() as u64;
@@ -1507,16 +1810,26 @@ impl Raft {
         let (prev_index, prev_term, entries) = if prev_index < self.log.snapshot_index() {
             let skip = (self.log.snapshot_index() - prev_index) as usize;
             if entries.len() <= skip {
-                self.send(
-                    io,
-                    from,
-                    RaftMsg::AppendEntriesResp {
-                        term: self.term,
-                        success: true,
-                        match_index: self.durable_index.min(last_new_index),
-                        conflict_index: NO_INDEX,
-                    },
-                );
+                let reply = RaftMsg::AppendEntriesResp {
+                    term: self.term,
+                    success: true,
+                    match_index: self.durable_index.min(last_new_index),
+                    conflict_index: NO_INDEX,
+                };
+                if dirty {
+                    // Same rule as the rejection below: a new term goes to
+                    // disk before anything is said in it. Sending the reply
+                    // directly would have the send guard withhold it, and with
+                    // nothing else writing the hard state, withhold every
+                    // reply to this leader for the rest of its term.
+                    let batch = self.persister.start(Persist::Reply {
+                        to: from,
+                        msg: reply,
+                    });
+                    self.write_hard_state(io, batch);
+                } else {
+                    self.send(io, from, reply);
+                }
                 return;
             }
             (
@@ -1592,6 +1905,7 @@ impl Raft {
             // duplicated AppendEntries deletes entries that came after it.
             self.stats.truncations += 1;
             self.log.truncate_from(last_new_index + 1);
+            self.refresh_config();
             self.durable_index = self.durable_index.min(last_new_index);
         }
         if let Some(i) = first_new {
@@ -1599,8 +1913,12 @@ impl Raft {
             if let Some(at) = conflict_at {
                 self.truncate(io, at);
             }
+            let brings_config = entries[i..].iter().any(|e| e.cmd.members().is_some());
             for e in &entries[i..] {
                 self.log.append(e.clone());
+            }
+            if brings_config {
+                self.refresh_config();
             }
             self.stats.entries_replicated += (entries.len() - i) as u64;
             if dirty {
@@ -1718,6 +2036,9 @@ impl Raft {
         );
         io.observe("truncate", &[at]);
         self.log.truncate_from(at);
+        // A membership entry that was truncated away takes its configuration
+        // with it: the server reverts to whatever came before.
+        self.refresh_config();
         let cap = at - 1;
         self.durable_index = self.durable_index.min(cap);
         self.persister.clamp_all(cap);
@@ -1786,6 +2107,7 @@ impl Raft {
             || self.cfg.bug == InjectedBug::CommitAnyTerm;
         if candidate > self.commit_index && own_term {
             self.commit_index = candidate;
+            self.step_aside_if_removed(io);
             io.observe("commit", &[self.commit_index]);
             io.trace(
                 Level::Debug,
@@ -1849,7 +2171,7 @@ impl Raft {
         let offset = HardState::slot_offset(hs.seq);
         self.state_seq += 1;
         let op = io.write_at(FILE_WAL, offset, &hs.to_slot());
-        self.persister.note_hard_state(batch, hs.term);
+        self.persister.note_hard_state(batch, hs);
         self.persister.note_write(batch, op);
     }
 
@@ -1910,7 +2232,7 @@ impl Raft {
                         self.send(io, p, msg.clone());
                     }
                     // A single-node cluster elects itself here.
-                    if self.votes.len() >= self.quorum() {
+                    if self.member_votes() >= self.quorum() {
                         self.become_leader(io);
                     }
                 }
@@ -1966,8 +2288,12 @@ impl Raft {
                 self.snapshot_in_flight = false;
                 self.durable_snapshot_file = Some(file);
                 // Only now, with the snapshot on stable storage, may the
-                // entries it replaces be dropped.
+                // entries it replaces be dropped -- including, possibly, the
+                // membership entry currently in force, which the snapshot now
+                // has to answer for.
+                self.snapshot_members = self.config_at(index).0;
                 self.log.compact_to(index, term);
+                self.refresh_config();
                 io.observe("compact", &[index]);
                 io.trace(
                     Level::Info,
@@ -2029,8 +2355,10 @@ impl Raft {
                 // reading a value that was overwritten long ago.
                 let restore = index > self.last_applied;
                 self.snapshot_data = data.clone();
+                let (snap_members, app) = decode_snapshot_payload(&data)
+                    .unwrap_or_else(|| (self.base_config(), Vec::new()));
                 if restore {
-                    self.pending_restore = Some(data);
+                    self.pending_restore = Some(app);
                 }
                 // If this node already holds the snapshot's last entry with the
                 // same term, everything after it is still valid and is kept --
@@ -2061,6 +2389,8 @@ impl Raft {
                 } else {
                     self.parked.clear();
                 }
+                self.snapshot_members = snap_members;
+                self.refresh_config();
                 self.durable_index = self.durable_index.max(index).min(self.log.last_index());
                 self.advance_durable(io);
                 self.commit_index = self.commit_index.max(index);
@@ -2120,11 +2450,12 @@ impl Raft {
         self.highest_snapshot = self.highest_snapshot.max(index);
         self.snapshot_in_flight = true;
         let file = self.next_snapshot_file();
+        let (members, _) = self.config_at(index);
         let snap = Snapshot {
             seq,
             index,
             term,
-            data,
+            data: encode_snapshot_payload(&members, &data),
         };
         let encoded = snap.encode();
         self.snapshot_data = snap.data.clone();
@@ -2188,7 +2519,15 @@ impl Raft {
             return;
         }
         if term > self.term {
-            self.step_down(io, term);
+            // The term must reach disk here, not just memory. Nothing in the
+            // install path writes the hard state: the snapshot goes to its own
+            // file and the completion only resets the log region. A node that
+            // first heard of this term through a snapshot therefore never
+            // made it durable, the send guard withheld every reply it owed the
+            // leader. The leader's retries kept resetting the follower's
+            // election timer, so no election came to the rescue either: the
+            // cluster stalled for good with a live leader and a live quorum.
+            self.step_down_and_persist(io, term);
         }
         if self.role != Role::Follower {
             self.role = Role::Follower;
@@ -2196,6 +2535,7 @@ impl Raft {
             self.heartbeat_timer.disarm(io);
         }
         self.leader = Some(leader);
+        self.last_leader_contact = io.now();
         self.reset_election_timer(io);
 
         // Nothing to install if this node is already at or past the snapshot.
@@ -2471,7 +2811,7 @@ mod tests {
             p.on_complete(3, true),
             BatchEvent::Done {
                 action: Persist::Quiet,
-                hard_term: None
+                hard: None
             }
         );
         assert_eq!(p.in_flight(), 0);
@@ -2501,14 +2841,14 @@ mod tests {
             p.on_complete(11, true),
             BatchEvent::Done {
                 action: Persist::Campaign { term: 1 },
-                hard_term: None
+                hard: None
             }
         );
         assert_eq!(
             p.on_complete(21, true),
             BatchEvent::Done {
                 action: Persist::Quiet,
-                hard_term: None
+                hard: None
             }
         );
     }
@@ -2537,7 +2877,7 @@ mod tests {
                     reply_to: None,
                     reply_term: 0
                 },
-                hard_term: None
+                hard: None
             }
         );
     }

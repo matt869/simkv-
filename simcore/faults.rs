@@ -39,6 +39,9 @@ pub enum FaultAction {
     ClockJump(NodeId, i64),
     /// End of the fault window: heal everything and restart every node.
     Recover,
+    /// Add or remove one server. The injector only decides *that* it happens;
+    /// the driver knows the current membership and picks which server.
+    Reconfigure,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +59,7 @@ pub struct FaultConfig {
     pub isolate_weight: u32,
     pub slow_link_weight: u32,
     pub clock_jump_weight: u32,
+    pub reconfig_weight: u32,
     pub heal_weight: u32,
     /// How long a partition lasts before it is healed automatically.
     pub partition_duration: (Nanos, Nanos),
@@ -85,6 +89,8 @@ pub struct FaultConfig {
     /// misses it almost every time; aiming at it turns a rare coincidence into
     /// a routine event.
     pub unsynced_bias_ppm: u32,
+    /// Change the cluster membership while everything else is going wrong.
+    pub enable_reconfig: bool,
 }
 
 impl Default for FaultConfig {
@@ -101,6 +107,7 @@ impl Default for FaultConfig {
             isolate_weight: 15,
             slow_link_weight: 10,
             clock_jump_weight: 5,
+            reconfig_weight: 15,
             heal_weight: 25,
             partition_duration: (100 * crate::MILLIS, 3 * crate::SECONDS),
             restart_delay: (50 * crate::MILLIS, 2 * crate::SECONDS),
@@ -110,6 +117,7 @@ impl Default for FaultConfig {
             max_clock_jump: 500 * crate::MILLIS,
             leader_bias_ppm: 300_000,
             unsynced_bias_ppm: 500_000,
+            enable_reconfig: false,
         }
     }
 }
@@ -133,6 +141,7 @@ impl FaultConfig {
             || self.enable_partitions
             || self.enable_clock_skew
             || self.enable_slow_links
+            || self.enable_reconfig
     }
 }
 
@@ -176,6 +185,7 @@ pub struct FaultStats {
     pub leader_targeted: u64,
     /// Crashes aimed at a node holding unsynced writes.
     pub unsynced_targeted: u64,
+    pub reconfigs: u64,
 }
 
 /// What the driver knows about the cluster, for aiming faults.
@@ -189,6 +199,12 @@ pub struct FaultHint<'a> {
     pub leader: Option<NodeId>,
     /// Per node: is it holding writes it has not synced?
     pub unsynced: &'a [bool],
+    /// Per node: is it in the current membership? Empty means everyone is.
+    ///
+    /// "Never take down a majority" has to mean a majority of the members.
+    /// With spare servers in the world, counting every node would let the
+    /// injector crash two of three members and call it a minority.
+    pub members: &'a [bool],
 }
 
 pub struct FaultInjector {
@@ -281,8 +297,12 @@ impl FaultInjector {
         // Build the menu of currently legal actions with their weights.
         let mut menu: Vec<(u32, FaultChoice)> = Vec::new();
         let c = &self.cfg;
+        let is_member =
+            |i: usize| hint.members.is_empty() || hint.members.get(i).copied().unwrap_or(false);
+        let member_count = (0..n).filter(|i| is_member(*i)).count();
+        let members_down = down.iter().filter(|d| is_member(d.idx())).count();
         if c.enable_crashes {
-            if down.len() < self.max_down(n) && !alive.is_empty() {
+            if members_down < self.max_down(member_count) && !alive.is_empty() {
                 menu.push((c.crash_weight, FaultChoice::Crash));
             }
             if !down.is_empty() {
@@ -299,6 +319,9 @@ impl FaultInjector {
         }
         if c.enable_clock_skew {
             menu.push((c.clock_jump_weight, FaultChoice::ClockJump));
+        }
+        if c.enable_reconfig {
+            menu.push((c.reconfig_weight, FaultChoice::Reconfigure));
         }
         let choice = weighted_pick(rng, &menu)?;
 
@@ -370,6 +393,10 @@ impl FaultInjector {
                 let sign = if rng.chance_ppm(500_000) { -1 } else { 1 };
                 FaultAction::ClockJump(NodeId(rng.below(n as u64) as u32), mag * sign)
             }
+            FaultChoice::Reconfigure => {
+                self.stats.reconfigs += 1;
+                FaultAction::Reconfigure
+            }
         };
         Some(action)
     }
@@ -392,6 +419,7 @@ enum FaultChoice {
     Heal,
     SlowLink,
     ClockJump,
+    Reconfigure,
 }
 
 fn weighted_pick(rng: &mut Rng, menu: &[(u32, FaultChoice)]) -> Option<FaultChoice> {

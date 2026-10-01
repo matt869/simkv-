@@ -54,6 +54,7 @@ impl Operation {
     fn render(&self) -> String {
         let op = match &self.op {
             Op::Noop => "noop".to_string(),
+            Op::SetMembers { members } => format!("set-members({})", members.len()),
             Op::Get { key } => format!("get({key})"),
             Op::Put { key, value } => format!("put({key}, {value})"),
             Op::Delete { key } => format!("del({key})"),
@@ -190,7 +191,9 @@ impl Reg {
 fn step(state: &Reg, op: &Operation) -> (bool, Reg) {
     let wildcard = op.outcome.is_none();
     match &op.op {
-        Op::Noop => (true, state.clone()),
+        // Membership entries never reach a client history; if one did, it
+        // would not touch any key.
+        Op::Noop | Op::SetMembers { .. } => (true, state.clone()),
         Op::Get { .. } => {
             let expected = Outcome::Value(state.as_opt().cloned());
             let ok = wildcard || op.outcome.as_ref() == Some(&expected);

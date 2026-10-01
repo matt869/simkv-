@@ -44,6 +44,8 @@ pub struct NodeView<'a> {
     /// longer in the log, which is not the same as being absent from history:
     /// a check that cannot see an entry there must skip it, not fail.
     pub snapshot_index: u64,
+    /// The membership this node is using.
+    pub members: &'a [NodeId],
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,6 +77,10 @@ pub struct CommittedRec {
     /// followers; if it were ever later than the real committing term, the
     /// effect is a weaker check, never a spurious failure.
     pub committed_in_term: u64,
+    /// The membership of the node that first reported this index committed --
+    /// normally the leader that committed it, and so the configuration whose
+    /// majority it was counted against. Durability is judged against it.
+    pub members: Vec<NodeId>,
 }
 
 #[derive(Default)]
@@ -96,6 +102,9 @@ pub struct Invariants {
     nodes: BTreeMap<NodeId, NodeTrack>,
     /// (node, term) -> longest log seen while it led that term.
     leader_log_len: BTreeMap<(NodeId, u64), u64>,
+    /// (node, term) -> highest membership entry already checked for that
+    /// leadership.
+    config_checked: BTreeMap<(NodeId, u64), u64>,
     checks: u64,
 }
 
@@ -247,6 +256,54 @@ impl Invariants {
             }
         }
 
+        // --- the membership-change rules ------------------------------
+        // Checked on the leader's log the first time a membership entry of its
+        // own term appears there, which is the event right after it was
+        // proposed -- so the commit index seen is the one it was proposed at.
+        //
+        // * One change at a time: no earlier membership entry may still be
+        //   uncommitted.
+        // * An entry of this term must already be committed (the 2015 fix).
+        if v.role == Role::Leader {
+            let seen = self.config_checked.entry((v.id, v.term)).or_insert(0);
+            let from = (*seen + 1).max(v.log.first_index());
+            let mut newest = *seen;
+            for index in from..=v.log.last_index() {
+                let Some(e) = v.log.get(index) else { continue };
+                if e.term != v.term || e.cmd.members().is_none() {
+                    continue;
+                }
+                newest = index;
+                if v.log.term_at(v.commit_index) != Some(v.term) {
+                    out.push(Violation::new(
+                        "config_before_term_commit",
+                        time,
+                        Some(v.id),
+                        format!(
+                            "leader of term {} proposed a membership change at index {index} \
+                             before committing any entry of its term (commit index {})",
+                            v.term, v.commit_index
+                        ),
+                    ));
+                }
+                let overlapping = (v.commit_index + 1..index)
+                    .filter(|i| v.log.get(*i).is_some_and(|e| e.cmd.members().is_some()))
+                    .count();
+                if overlapping > 0 {
+                    out.push(Violation::new(
+                        "concurrent_config_change",
+                        time,
+                        Some(v.id),
+                        format!(
+                            "membership change at index {index} proposed while an earlier one \
+                             was still uncommitted"
+                        ),
+                    ));
+                }
+            }
+            *seen = newest.max(*seen);
+        }
+
         // --- election safety -------------------------------------------
         if v.role == Role::Leader {
             match self.leader_by_term.get(&v.term) {
@@ -388,6 +445,7 @@ impl Invariants {
                             term: entry.term,
                             cmd: entry.cmd.clone(),
                             committed_in_term: v.term,
+                            members: v.members.to_vec(),
                         },
                     );
                     self.max_committed = self.max_committed.max(index);
@@ -484,6 +542,7 @@ mod tests {
             incarnation: 0,
             truncations: 0,
             snapshot_index: 0,
+            members: &[],
         }
     }
 

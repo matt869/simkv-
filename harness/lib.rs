@@ -32,7 +32,11 @@ use simcore::{Nanos, MILLIS, SECONDS};
 #[derive(Clone, Debug)]
 pub struct SimConfig {
     pub seed: u64,
+    /// Servers in the initial membership.
     pub servers: usize,
+    /// Extra server slots that start outside the cluster and can be added to
+    /// it by a membership change.
+    pub spares: usize,
     pub clients: usize,
     /// How long faults are injected for.
     pub duration: Nanos,
@@ -68,6 +72,18 @@ impl SimConfig {
         self.raft.bug = bug;
         self
     }
+
+    /// Change membership during the run, with `spares` extra servers to add.
+    pub fn with_reconfig(mut self, spares: usize) -> SimConfig {
+        self.spares = spares;
+        self.faults.enable_reconfig = true;
+        self
+    }
+
+    /// Every server slot in the world, members or not.
+    pub fn slots(&self) -> usize {
+        self.servers + self.spares
+    }
 }
 
 impl Default for SimConfig {
@@ -76,6 +92,7 @@ impl Default for SimConfig {
         SimConfig {
             seed: 0,
             servers: 3,
+            spares: 0,
             clients: 4,
             duration,
             settle: 15 * SECONDS,
@@ -157,6 +174,10 @@ pub struct RunStats {
     pub linearizability_steps: u64,
     /// Reads answered through ReadIndex rather than through the log.
     pub index_reads: u64,
+    /// Membership changes proposed, and ones the leader refused (another in
+    /// progress, or no entry of its term committed yet).
+    pub reconfigs: u64,
+    pub reconfigs_refused: u64,
 }
 
 /// The result of one run.
@@ -336,6 +357,9 @@ mod tests {
     /// flaky test waiting to happen.
     fn find_failure(bug: InjectedBug, seeds: u64) -> Option<(u64, &'static str)> {
         let mut base = SimConfig::with_seed(1).with_bug(bug);
+        if bug == InjectedBug::ConfigBeforeTermCommit {
+            base = base.with_reconfig(2);
+        }
         base.duration = 6 * SECONDS;
         base.settle = 10 * SECONDS;
         base.drain = 3 * SECONDS;
@@ -365,6 +389,18 @@ mod tests {
             match (found, bug.detection_gap()) {
                 (Some((seed, signature)), _) => {
                     assert_ne!(signature, "ok");
+                    // Every defect here breaks a safety property, so it has to
+                    // be caught by one. A stalled cluster is not a catch: for a
+                    // long time vote-before-sync "passed" this test as
+                    // no_progress_after_recovery, because the send guard was
+                    // dropping its early votes rather than letting them out,
+                    // and the defect it claims to model was never exercised.
+                    assert_ne!(
+                        signature,
+                        "no_progress_after_recovery",
+                        "{} was caught only as a stall at seed {seed}",
+                        bug.name()
+                    );
                     println!("{} caught at seed {seed} as [{signature}]", bug.name());
                 }
                 (None, Some(why)) => {
@@ -429,6 +465,33 @@ mod tests {
         // into the file holding the only durable snapshot and truncated it, and
         // a crash lost both -- along with every entry they had absorbed.
         snapshot_regression(287, 10, 5, 2);
+    }
+
+    #[test]
+    fn a_term_learned_from_a_snapshot_reaches_disk() {
+        // A follower restarted at term 15 and first heard of term 17 through
+        // InstallSnapshot. That path adopted the term in memory but never wrote
+        // the hard state, so the send guard withheld every reply it owed the
+        // leader -- whose retries kept its election timer quiet. The cluster
+        // stalled for good with a live leader and a live quorum.
+        let mut cfg = SimConfig::with_seed(392).with_reconfig(2);
+        cfg.raft.snapshot_threshold = 5;
+        cfg.raft.max_batch = 2;
+        cfg.normalise();
+        let out = run(cfg);
+        assert!(!out.failed(), "{}", out.detail());
+    }
+
+    #[test]
+    fn a_repeated_vote_request_waits_for_the_vote_to_be_durable() {
+        // A duplicated RequestVote arrived while the first grant's hard-state
+        // write was in flight. The term had been durable for a while, so the
+        // term-only send guard let the repeat grant out before the vote itself
+        // reached disk -- a crash there would forget a vote already cast.
+        let mut cfg = SimConfig::with_seed(480).with_reconfig(2);
+        cfg.normalise();
+        let out = run(cfg);
+        assert!(!out.failed(), "{}", out.detail());
     }
 
     #[test]

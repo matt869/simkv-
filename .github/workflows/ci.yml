@@ -33,3 +33,6 @@ jobs:
       # shows up one run in a thousand still fails the build -- and the failing
       # seed in the log is a complete reproduction.
       - run: cargo run --release -p harness --bin sim -- sweep --seeds 2000 --duration 8000 --settle 12000 --drain 3000
+      # The same with servers joining and leaving mid-run, at a snapshot threshold
+      # low enough that new members are caught up by InstallSnapshot.
+      - run: cargo run --release -p harness --bin sim -- sweep --seeds 1000 --reconfig --snapshot-threshold 5 --max-batch 2 --duration 8000 --settle 12000 --drain 3000

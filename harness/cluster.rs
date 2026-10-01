@@ -22,7 +22,7 @@ use checker::durability::{self, CommittedEntry, DiskView};
 use checker::invariants::{Invariants, NodeView};
 use checker::linearizability::{Checker, History, Verdict};
 use checker::{Report, Violation};
-use kvstore::log::{Entry, RaftLog};
+use kvstore::log::{recover_hard_state, Entry, RaftLog};
 use kvstore::raft::{RaftMsg, ReadEvent, Role};
 use kvstore::{KvServer, Message};
 use sim_io::{SimIo, FILE_SNAPSHOT_A, FILE_SNAPSHOT_B, FILE_WAL};
@@ -40,6 +40,8 @@ const APP_STOP: u32 = 5;
 
 pub struct Cluster {
     world: World,
+    /// Server slots: the initial members plus any spares.
+    slots: usize,
     servers: Vec<Option<KvServer>>,
     clients: Vec<Client>,
     members: Vec<NodeId>,
@@ -81,8 +83,10 @@ pub struct Cluster {
 impl Cluster {
     pub fn new(cfg: SimConfig) -> Cluster {
         let members: Vec<NodeId> = (0..cfg.servers as u32).map(NodeId).collect();
+        let slots = cfg.slots();
+        let all_servers: Vec<NodeId> = (0..slots as u32).map(NodeId).collect();
         let mut world = World::new(WorldConfig {
-            nodes: cfg.servers + cfg.clients,
+            nodes: slots + cfg.clients,
             seed: cfg.seed,
             net: cfg.net.clone(),
             disk: cfg.disk.clone(),
@@ -90,8 +94,10 @@ impl Cluster {
             trace_level: cfg.trace_level,
         });
 
-        let mut servers = Vec::with_capacity(cfg.servers);
-        for i in 0..cfg.servers {
+        // Every slot runs a server. The spares start knowing the initial
+        // membership, see that they are not in it, and wait to be added.
+        let mut servers = Vec::with_capacity(slots);
+        for i in 0..slots {
             let node = NodeId(i as u32);
             let seed = node_seed(cfg.seed, node, 0);
             let mut io = SimIo::new(&mut world, node);
@@ -108,8 +114,8 @@ impl Cluster {
             .map(|i| {
                 Client::new(
                     i as u32,
-                    NodeId((cfg.servers + i) as u32),
-                    members.clone(),
+                    NodeId((slots + i) as u32),
+                    all_servers.clone(),
                     cfg.seed ^ 0xC11E_0000 ^ i as u64,
                     cfg.workload.clone(),
                 )
@@ -120,6 +126,7 @@ impl Cluster {
         let cfg_servers = servers.len();
         Cluster {
             world,
+            slots,
             servers,
             clients,
             members,
@@ -228,7 +235,7 @@ impl Cluster {
 
     fn on_timer(&mut self, node: NodeId, timer: u64, now: Nanos) {
         if self.is_client(node) {
-            let i = node.idx() - self.cfg.servers;
+            let i = node.idx() - self.slots;
             let mut io = SimIo::new(&mut self.world, node);
             self.clients[i].on_timer(&mut io, &mut self.history, now, timer);
             return;
@@ -270,7 +277,36 @@ impl Cluster {
                             now,
                             Some(from),
                             format!(
-                                "acknowledged match_index {match_index}, but has never had                                  more than {seen} entries durable"
+                                "acknowledged match_index {match_index}, but has never had \
+                                 more than {seen} entries durable"
+                            ),
+                        ));
+                    }
+                }
+
+                // The same rule for votes: a granted vote is a promise not to
+                // vote for anyone else in that term, and a promise only a disk
+                // can keep across a crash. By the time it is seen here, the
+                // voter's stable storage must already hold that vote -- or a
+                // later term, which supersedes it. Waiting for the damage
+                // instead (two leaders, a lost term) caught this one seed in
+                // fifteen; the moment of the act is always visible.
+                if let RaftMsg::RequestVoteResp {
+                    term,
+                    granted: true,
+                } = m
+                {
+                    let hs = recover_hard_state(&self.world.durable_image(from, FILE_WAL));
+                    let kept = hs.term > term || (hs.term == term && hs.voted_for == Some(to));
+                    if !kept {
+                        self.report.add(Violation::new(
+                            "vote_beyond_durable",
+                            now,
+                            Some(from),
+                            format!(
+                                "granted {to} its vote in term {term}, but its disk holds \
+                                 term {} voted_for {:?}",
+                                hs.term, hs.voted_for
                             ),
                         ));
                     }
@@ -282,7 +318,7 @@ impl Cluster {
         }
         self.stats.messages_delivered += 1;
         if self.is_client(to) {
-            let i = to.idx() - self.cfg.servers;
+            let i = to.idx() - self.slots;
             let mut io = SimIo::new(&mut self.world, to);
             self.clients[i].on_bytes(&mut io, &mut self.history, now, payload);
         } else if let Some(server) = self.servers[to.idx()].as_mut() {
@@ -294,10 +330,15 @@ impl Cluster {
     fn on_app(&mut self, tag: u32, arg: u64, now: Nanos) {
         match tag {
             APP_FAULT_TICK => {
-                let up: Vec<bool> = self.world.up_flags()[..self.cfg.servers].to_vec();
+                let up: Vec<bool> = self.world.up_flags()[..self.slots].to_vec();
+                let config = self.cluster_config();
+                let members: Vec<bool> = (0..self.slots as u32)
+                    .map(|i| config.contains(&NodeId(i)))
+                    .collect();
                 let hint = FaultHint {
                     leader: self.current_leader(),
                     unsynced: &self.unsynced_flags(),
+                    members: &members,
                 };
                 if let Some(action) = self
                     .world
@@ -368,12 +409,11 @@ impl Cluster {
             FaultAction::SlowLink(a, b) => self.world.net.slow_link(a, b),
             FaultAction::HealNetwork => self.world.net.heal_all(),
             FaultAction::ClockJump(node, delta) => self.world.clock_jump(node, delta),
+            FaultAction::Reconfigure => self.reconfigure(),
             FaultAction::Recover => {
                 self.world.net.heal_all();
-                let down: Vec<NodeId> = self
-                    .members
-                    .iter()
-                    .copied()
+                let down: Vec<NodeId> = (0..self.slots as u32)
+                    .map(NodeId)
                     .filter(|n| !self.world.is_up(*n))
                     .collect();
                 for n in down {
@@ -458,7 +498,7 @@ impl Cluster {
     /// A node that hit a storage error takes itself down; bring it back after a
     /// pause, the way a supervisor would restart a crashed process.
     fn reap_failed(&mut self) {
-        for i in 0..self.cfg.servers {
+        for i in 0..self.slots {
             let node = NodeId(i as u32);
             let failed = self.servers[i].as_ref().is_some_and(|s| s.failed());
             if failed {
@@ -484,7 +524,7 @@ impl Cluster {
     /// too.
     fn current_leader(&self) -> Option<NodeId> {
         let mut best: Option<(u64, NodeId)> = None;
-        for i in 0..self.cfg.servers {
+        for i in 0..self.slots {
             let id = NodeId(i as u32);
             if !self.world.is_up(id) {
                 continue;
@@ -500,12 +540,75 @@ impl Cluster {
 
     /// Which servers are holding writes they have not synced.
     fn unsynced_flags(&self) -> Vec<bool> {
-        (0..self.cfg.servers)
+        (0..self.slots)
             .map(|i| {
                 let id = NodeId(i as u32);
                 self.world.is_up(id) && self.world.has_unsynced(id, FILE_WAL)
             })
             .collect()
+    }
+
+    /// The membership the cluster is using, as far as the driver can tell: the
+    /// leader's, or failing that the most up-to-date live node's.
+    fn cluster_config(&self) -> Vec<NodeId> {
+        if let Some(l) = self.current_leader() {
+            if let Some(s) = &self.servers[l.idx()] {
+                return s.raft.members().to_vec();
+            }
+        }
+        (0..self.slots)
+            .filter_map(|i| self.servers[i].as_ref())
+            .max_by_key(|s| (s.raft.term(), s.raft.log().last_index()))
+            .map(|s| s.raft.members().to_vec())
+            .unwrap_or_else(|| self.members.clone())
+    }
+
+    /// Ask the leader to add or remove one server, the way an operator would.
+    ///
+    /// Never shrinks below three members: a two-member cluster cannot survive
+    /// a single crash, and the run would test little but its own unavailability.
+    fn reconfigure(&mut self) {
+        let Some(leader) = self.current_leader() else {
+            return;
+        };
+        let Some(current) = self.servers[leader.idx()]
+            .as_ref()
+            .map(|s| s.raft.members().to_vec())
+        else {
+            return;
+        };
+        let outside: Vec<NodeId> = (0..self.slots as u32)
+            .map(NodeId)
+            .filter(|n| !current.contains(n))
+            .collect();
+        let can_add = !outside.is_empty();
+        let can_remove = current.len() > 3;
+        let add = match (can_add, can_remove) {
+            (true, true) => self.world.rng.chance_ppm(500_000),
+            (true, false) => true,
+            (false, true) => false,
+            (false, false) => return,
+        };
+        let mut next = current.clone();
+        if add {
+            let Some(n) = self.world.rng.choose(&outside).copied() else {
+                return;
+            };
+            next.push(n);
+        } else {
+            let Some(n) = self.world.rng.choose(&current).copied() else {
+                return;
+            };
+            next.retain(|m| *m != n);
+        }
+        let Some(server) = self.servers[leader.idx()].as_mut() else {
+            return;
+        };
+        let mut io = SimIo::new(&mut self.world, leader);
+        match server.propose_membership(&mut io, next) {
+            Ok(_) => self.stats.reconfigs += 1,
+            Err(_) => self.stats.reconfigs_refused += 1,
+        }
     }
 
     /// Everything of a node's that would survive a power cut.
@@ -521,7 +624,7 @@ impl Cluster {
     }
 
     fn is_client(&self, node: NodeId) -> bool {
-        node.idx() >= self.cfg.servers
+        node.idx() >= self.slots
     }
 
     /// The ReadIndex rule, checked directly.
@@ -544,7 +647,7 @@ impl Cluster {
     fn check_reads(&mut self) {
         let now = self.world.now();
         let committed_before = self.invariants.max_committed();
-        for i in 0..self.cfg.servers {
+        for i in 0..self.slots {
             let node = NodeId(i as u32);
             let events = match self.servers[i].as_mut() {
                 Some(s) => s.raft.take_read_events(),
@@ -582,7 +685,7 @@ impl Cluster {
     /// actually survive a power cut.
     fn check_durable_claims(&mut self) {
         let now = self.world.now();
-        for i in 0..self.cfg.servers {
+        for i in 0..self.slots {
             let node = NodeId(i as u32);
             if !self.world.is_up(node) {
                 continue;
@@ -604,7 +707,7 @@ impl Cluster {
 
     fn check_invariants(&mut self) {
         let now = self.world.now();
-        for i in 0..self.cfg.servers {
+        for i in 0..self.slots {
             let Some(s) = &self.servers[i] else { continue };
             let n = s.raft.stats().truncated_committed;
             if n > self.truncated_committed_seen[i] {
@@ -614,13 +717,13 @@ impl Cluster {
                     now,
                     Some(NodeId(i as u32)),
                     format!(
-                        "node truncated its log at or below its own commit index                          (commit {})",
+                        "node truncated its log at or below its own commit index (commit {})",
                         s.raft.commit_index()
                     ),
                 ));
             }
         }
-        let views: Vec<NodeView> = (0..self.cfg.servers)
+        let views: Vec<NodeView> = (0..self.slots)
             .map(|i| {
                 let id = NodeId(i as u32);
                 match &self.servers[i] {
@@ -636,6 +739,7 @@ impl Cluster {
                         incarnation: self.world.incarnation(id),
                         truncations: s.raft.stats().truncations,
                         snapshot_index: s.raft.log().snapshot_index(),
+                        members: s.raft.members(),
                     },
                     None => NodeView {
                         id,
@@ -649,6 +753,7 @@ impl Cluster {
                         incarnation: self.world.incarnation(id),
                         truncations: 0,
                         snapshot_index: 0,
+                        members: &[],
                     },
                 }
             })
@@ -677,16 +782,16 @@ impl Cluster {
         }
 
         // Replicas that have applied the same number of entries must agree.
-        let states: Vec<(NodeId, u64, &std::collections::BTreeMap<String, String>)> =
-            (0..self.cfg.servers)
-                .filter_map(|i| {
-                    let id = NodeId(i as u32);
-                    let s = self.servers[i].as_ref()?;
-                    self.world
-                        .is_up(id)
-                        .then(|| (id, s.raft.last_applied(), s.state()))
-                })
-                .collect();
+        let states: Vec<(NodeId, u64, &std::collections::BTreeMap<String, String>)> = (0..self
+            .slots)
+            .filter_map(|i| {
+                let id = NodeId(i as u32);
+                let s = self.servers[i].as_ref()?;
+                self.world
+                    .is_up(id)
+                    .then(|| (id, s.raft.last_applied(), s.state()))
+            })
+            .collect();
         self.report
             .extend(durability::check_convergence(now, &states));
 
@@ -699,15 +804,15 @@ impl Cluster {
                         index,
                         term: rec.term,
                         cmd: rec.cmd.clone(),
+                        members: rec.members.clone(),
                     })
             })
             .collect();
-        let disks: Vec<DiskView> = self.members.iter().map(|n| self.disk_view(*n)).collect();
+        let disks: Vec<DiskView> = (0..self.slots as u32)
+            .map(|n| self.disk_view(NodeId(n)))
+            .collect();
         self.report.extend(durability::check_committed_durable(
-            now,
-            &committed,
-            &disks,
-            self.cfg.servers,
+            now, &committed, &disks, self.slots,
         ));
 
         // Efficiency. A storm of messages that makes no progress breaks no
@@ -725,7 +830,7 @@ impl Cluster {
         let completed = self.history.completed() as u64;
         if self.cfg.check_efficiency && !self.incomplete && completed >= 100 {
             let per_op = self.events / completed;
-            let bound = 40 * self.cfg.servers.max(1) as u64;
+            let bound = 40 * self.slots.max(1) as u64;
             if per_op > bound {
                 self.report.add(Violation::new(
                     "message_storm",

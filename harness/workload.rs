@@ -452,7 +452,9 @@ mod tests {
                 Op::Put { .. } => writes += 1,
                 Op::Cas { .. } => cas += 1,
                 Op::Delete { .. } => dels += 1,
-                Op::Noop => panic!("clients never issue noops"),
+                Op::Noop | Op::SetMembers { .. } => {
+                    panic!("clients never issue Raft's own entries")
+                }
             }
         }
         assert!(reads > 1200 && reads < 2000, "reads = {reads}");

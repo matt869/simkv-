@@ -244,7 +244,9 @@ impl StateMachine {
     /// Run one committed command. Applying the same `(client, seq)` twice is
     /// a no-op that returns the original result.
     pub fn apply(&mut self, cmd: &Command) -> Outcome {
-        if cmd.is_noop() {
+        if cmd.is_noop() || cmd.members().is_some() {
+            // Raft's own entries: nothing for the key-value map, and no client
+            // session to remember them against.
             return Outcome::Written;
         }
         if let Some(s) = self.sessions.get(&cmd.client) {
@@ -257,7 +259,7 @@ impl StateMachine {
             }
         }
         let outcome = match &cmd.op {
-            Op::Noop => Outcome::Written,
+            Op::Noop | Op::SetMembers { .. } => Outcome::Written,
             Op::Get { key } => Outcome::Value(self.state.get(key).cloned()),
             Op::Put { key, value } => {
                 self.state.insert(key.clone(), value.clone());
@@ -496,6 +498,15 @@ impl KvServer {
             }
         }
         self.drain(io);
+    }
+
+    /// Ask this node, as leader, to change the cluster by one server.
+    pub fn propose_membership(
+        &mut self,
+        io: &mut dyn Io,
+        members: Vec<NodeId>,
+    ) -> Result<u64, &'static str> {
+        self.raft.propose_membership(io, members)
     }
 
     /// Adopt a snapshot that Raft has made durable, replacing the state

@@ -111,7 +111,7 @@ pub fn describe(cfg: &SimConfig) -> String {
     format!(
         "  seed={} servers={} clients={} keys={} duration={}ms settle={}ms\n  \
          faults=[{}]\n  net=[{}]\n  disk=[{}]\n  workload=[{}]\n  \
-         raft=[reads={} batch={} snapshot-every={}]",
+         raft=[reads={} batch={} snapshot-every={}] membership=[spares={} reconfig={}]",
         cfg.seed,
         cfg.servers,
         cfg.clients,
@@ -125,6 +125,8 @@ pub fn describe(cfg: &SimConfig) -> String {
         cfg.raft.read_mode.name(),
         cfg.raft.max_batch,
         cfg.raft.snapshot_threshold,
+        cfg.spares,
+        cfg.faults.enable_reconfig,
     )
 }
 
@@ -257,6 +259,14 @@ fn candidates() -> Vec<Candidate> {
             (cfg.settle > 5 * simcore::SECONDS).then(|| {
                 let mut n = cfg.clone();
                 n.settle = (cfg.settle / 2).max(5 * simcore::SECONDS);
+                n
+            })
+        }),
+        c("no membership changes", |cfg| {
+            (cfg.faults.enable_reconfig || cfg.spares > 0).then(|| {
+                let mut n = cfg.clone();
+                n.faults.enable_reconfig = false;
+                n.spares = 0;
                 n
             })
         }),

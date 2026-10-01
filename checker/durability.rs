@@ -106,6 +106,8 @@ pub struct CommittedEntry {
     pub index: u64,
     pub term: u64,
     pub cmd: Command,
+    /// The membership it was committed under. Empty means "every disk given".
+    pub members: Vec<NodeId>,
 }
 
 /// Check that everything the cluster considers committed is durable on a
@@ -117,7 +119,6 @@ pub fn check_committed_durable(
     cluster_size: usize,
 ) -> Vec<Violation> {
     let mut out = Vec::new();
-    let quorum = cluster_size / 2 + 1;
     let recovered: Vec<(NodeId, Recovered)> = disks
         .iter()
         .map(|d| {
@@ -135,8 +136,17 @@ pub fn check_committed_durable(
         // and the leader will overwrite it again on recovery. What matters is
         // whether enough nodes hold the real thing, which is what is checked
         // below.
+        // A majority of the configuration the entry was committed under. With
+        // membership changing, "the cluster" is not one fixed set of disks.
+        let voters = if c.members.is_empty() {
+            cluster_size
+        } else {
+            c.members.len()
+        };
+        let quorum = voters / 2 + 1;
         let holders = recovered
             .iter()
+            .filter(|(id, _)| c.members.is_empty() || c.members.contains(id))
             .filter(|(_, r)| {
                 // Inside a snapshot the entry is held but its command is no
                 // longer separately visible: the snapshot was built from the
@@ -154,8 +164,8 @@ pub fn check_committed_durable(
                 None,
                 format!(
                     "committed index {} (term {}) is on stable storage on only {holders} of {} \
-                     nodes; a quorum is {quorum}",
-                    c.index, c.term, cluster_size
+                     members; a quorum is {quorum}",
+                    c.index, c.term, voters
                 ),
             ));
             // One report is enough; the rest of the log will say the same.
@@ -400,6 +410,7 @@ mod tests {
                 index: e.index,
                 term: e.term,
                 cmd: e.cmd.clone(),
+                members: Vec::new(),
             })
             .collect()
     }

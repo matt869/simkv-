@@ -56,9 +56,10 @@ back, so a correct cluster has to demonstrably recover — otherwise "wedged" an
   never got an answer may be placed anywhere after their invocation, or nowhere
   at all, because a client that timed out genuinely does not know.
 - **The rules themselves, not just their consequences** — a follower may never
-  acknowledge more than it has synced; a leader may only commit onto an entry of
-  its own term; a read may never be served at an index below something already
-  committed. Waiting for the *damage* these cause needs a long run of bad luck;
+  acknowledge more than it has synced; a vote may never be granted before it is
+  on disk; a leader may only commit onto an entry of its own term, and may only
+  change the membership once it has, one server at a time; a read may never be
+  served at an index below something already committed. Waiting for the *damage* these cause needs a long run of bad luck;
   checking the rule fires on the first offending event.
 - **Efficiency** — a message storm breaks no safety property, so nothing above
   can see one. Healthy runs cost about 15 events per operation; a run far above
@@ -77,8 +78,10 @@ sim demo                                            a tour of all of the above
 Useful knobs for reaching states the defaults do not: `--max-batch N` (small
 batches make followers acknowledge at an old-term index), `--snapshot-threshold
 N` (low values force constant compaction and snapshot transfer),
-`--reads log|index`, `--quorum-loss`, and `--bug NAME` (seven deliberate
-defects, every one of which the checkers catch).
+`--reads log|index`, `--quorum-loss`, `--reconfig` (add and remove servers
+while faults are injected; `--spares N` sets how many slots sit outside the
+initial membership), `--no-stickiness`, and `--bug NAME` (eight deliberate
+defects, every one of which the checkers catch by a safety rule, not a stall).
 
 Exit status is 0 when nothing failed and 1 when something did, so a sweep drops
 straight into CI.
@@ -105,7 +108,22 @@ Against putting every read through the log, that makes sweeps 2.1× faster on
 fault-free runs and 1.3× faster under faults, with a third fewer log entries.
 `--reads log` switches back.
 
-Deliberately **not** implemented: membership changes, and lease-based reads —
+**Membership changes** are single-server (Raft thesis §4.1): a configuration
+takes effect as soon as it is in a log, a leader proposes one only after
+committing an entry of its own term, and never with a previous change still
+uncommitted. A leader that removes itself keeps leading until the change commits,
+then steps aside. Snapshots carry the membership in force at their index. With
+`--reconfig` the fault injector adds and removes servers mid-run, and every
+quorum the checkers compute — durability included — is the quorum of the
+configuration that entry was committed under.
+
+**Leader stickiness** (thesis §4.2.3) is on by default: a server that has heard
+from a leader within the minimum election timeout ignores vote requests, even
+at higher terms. Without it, a removed server that never learns of its removal
+times out and disrupts the cluster forever — over 400 reconfiguring seeds,
+stickiness completes 16% more operations.
+
+Deliberately **not** implemented: joint consensus, and lease-based reads —
 which trade the probe round for a dependence on bounded clock drift, in a
 simulator that deliberately skews and steps every clock.
 

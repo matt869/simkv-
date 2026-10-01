@@ -53,7 +53,13 @@ COMMON OPTIONS:
     --bug NAME          Inject a deliberate defect, to prove the checkers see it:
                         ack-before-sync, commit-any-term, vote-before-sync,
                         no-dedup, truncate-on-any-append, read-without-quorum,
-                        read-before-term-commit
+                        read-before-term-commit, config-before-term-commit
+                        (the last needs --reconfig to have anything to break)
+    --reconfig          Add and remove servers while faults are injected
+                        (implies --spares 2 unless given)
+    --spares N          Extra server slots outside the initial membership
+    --no-stickiness     Let servers adopt a higher term even while hearing from
+                        a leader (disables Raft thesis 4.2.3)
     --reads MODE        index (default): ReadIndex, no log write per read;
                         log: every read goes through the log
     --trace LEVEL       off | error | warn | info | debug (default off)
@@ -253,6 +259,17 @@ fn config(args: &Args) -> SimConfig {
     }
     if args.has("no-liveness") {
         cfg.check_liveness = false;
+    }
+    if let Some(n) = args.opt_u64("spares") {
+        cfg.spares = n as usize;
+    }
+    if args.has("reconfig") {
+        // Membership changes need somewhere to grow into.
+        let spares = if cfg.spares == 0 { 2 } else { cfg.spares };
+        cfg = cfg.with_reconfig(spares);
+    }
+    if args.has("no-stickiness") {
+        cfg.raft.leader_stickiness = false;
     }
     if let Some(mode) = args.get("reads") {
         match ReadMode::parse(mode) {
