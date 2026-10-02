@@ -26,6 +26,9 @@ pub struct SweepConfig {
     pub stop_after: usize,
     /// Print a line for every run rather than only for failures.
     pub verbose: bool,
+    /// Print nothing per run, not even failures; the caller reports from the
+    /// result.
+    pub quiet: bool,
 }
 
 impl Default for SweepConfig {
@@ -37,6 +40,7 @@ impl Default for SweepConfig {
             threads: default_threads(),
             stop_after: 0,
             verbose: false,
+            quiet: false,
         }
     }
 }
@@ -169,7 +173,7 @@ fn record(shared: &Mutex<SweepResult>, cfg: &SweepConfig, stop: &AtomicBool, out
     if outcome.failed() {
         let signature = outcome.signature();
         *r.by_signature.entry(signature).or_insert(0) += 1;
-        if !cfg.verbose {
+        if !cfg.verbose && !cfg.quiet {
             println!("FAIL seed {} [{}]", outcome.seed, signature);
         }
         r.failures.push(Failure {
@@ -196,6 +200,7 @@ mod tests {
             threads: 4,
             stop_after: 0,
             verbose: false,
+            quiet: false,
         };
         let r = sweep(cfg);
         assert_eq!(r.runs, 8);
@@ -214,6 +219,7 @@ mod tests {
             threads,
             stop_after: 0,
             verbose: false,
+            quiet: false,
         };
         let a = sweep(mk(1));
         let b = sweep(mk(6));
@@ -232,6 +238,7 @@ mod tests {
             threads: 2,
             stop_after: 1,
             verbose: false,
+            quiet: false,
         };
         let r = sweep(cfg);
         assert_eq!(r.runs, 4);

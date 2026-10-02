@@ -130,16 +130,22 @@ A harness that has never failed is indistinguishable from one that cannot fail.
 asserts each is detected, and `an_unmodified_store_survives_the_same_seeds` is
 the control.
 
+The table below is generated, not typed: `sim bugs` sweeps 300 seeds per defect
+plus an unmodified control and prints it, and fails if a defect goes unseen, is
+seen only as a stall, or the control fails. CI runs it on every push. A typed
+table is how the `vote-before-sync` row stayed wrong for so long (see the
+correction below).
+
 | Defect | Detection | Caught by |
 |---|---|---|
-| `ack-before-sync` — acknowledge before `fsync` | 300 of 300 | `ack_beyond_durable` |
-| `commit-any-term` — Raft Figure 8 | 216 of 300 | `commit_of_foreign_term` |
-| `vote-before-sync` — reveal a vote before it is durable | 142 of 300 | `vote_beyond_durable` |
-| `no-dedup` — retried requests apply twice | 299 of 300 | `linearizability` |
-| `truncate-on-any-append` — trust the leader's length | 300 of 300 | `commit_beyond_log` |
-| `read-without-quorum` — ReadIndex without confirming leadership | 17 of 300 | `stale_read_index` |
-| `read-before-term-commit` — ReadIndex before a current-term commit | 21 of 300 | `stale_read_index` |
-| `config-before-term-commit` — change membership before a current-term commit | 31 of 400 (`--reconfig`) | `config_before_term_commit` |
+| `ack-before-sync` — acknowledges entries before they are durable | 300 of 300 | `ack_beyond_durable` |
+| `commit-any-term` — commits by counting replicas of any term | 216 of 300 | `commit_of_foreign_term` |
+| `vote-before-sync` — votes before the vote is durable | 142 of 300 | `vote_beyond_durable` (138), `durable_term_lost` (4) |
+| `no-dedup` — applies retried client requests twice | 299 of 300 | `linearizability` |
+| `truncate-on-any-append` — truncates the log on any mismatch in length | 300 of 300 | `commit_beyond_log` (298), `leader_completeness` (2) |
+| `read-without-quorum` — serves reads without confirming leadership | 17 of 300 | `stale_read_index` |
+| `read-before-term-commit` — serves reads before committing an entry of its own term | 21 of 300 | `stale_read_index` |
+| `config-before-term-commit` — changes membership before committing an entry of its own term | 24 of 300 (`--reconfig`) | `config_before_term_commit` |
 
 There is no longer a defect on this list the harness cannot see, and the test
 that asserts it is strict: no known-gap escape hatch, and — since the
@@ -415,7 +421,7 @@ their own: `config_before_term_commit` (a leader changed the membership before
 committing an entry of its own term — the bug in the original single-server
 algorithm, fixed on raft-dev in 2015) and `concurrent_config_change` (a second
 change proposed while one is still uncommitted). The matching defect,
-`config-before-term-commit`, is caught in 31 of 400 reconfiguring seeds.
+`config-before-term-commit`, is caught in 24 of 300 reconfiguring seeds.
 
 ### A removed server that never finds out
 

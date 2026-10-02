@@ -5,6 +5,7 @@
 //! sim sweep   [--seeds N] [--threads N]  many seeds, hunting for failures
 //! sim replay  --seed N [--trace LEVEL]   re-run a seed, verbose and verified
 //! sim shrink  --seed N                   cut a failure down to a minimal repro
+//! sim bugs    [--seeds N]                measure how often each injected defect is caught
 //! sim demo                               a quick tour of all of the above
 //! ```
 //!
@@ -31,6 +32,7 @@ COMMANDS:
     sweep     Run many seeds in parallel and report failing ones
     replay    Re-run one seed with tracing, and verify determinism
     shrink    Reduce a failing configuration to a minimal reproduction
+    bugs      Sweep every injected defect and print the detection table
     demo      A short end-to-end demonstration
 
 COMMON OPTIONS:
@@ -81,6 +83,11 @@ REPLAY OPTIONS:
 SHRINK OPTIONS:
     --budget N          Maximum candidate runs (default 120)
 
+BUGS OPTIONS:
+    --seeds N           Seeds per defect, and for the control (default 300).
+                        Fails if any defect goes unseen, is seen only as a
+                        stall, or if the unmodified store fails at all
+
 EXIT STATUS:
     0  no failures    1  failures found    2  usage error
 ";
@@ -106,6 +113,7 @@ fn main() {
         "sweep" => cmd_sweep(&args),
         "replay" => cmd_replay(&args),
         "shrink" => cmd_shrink(&args),
+        "bugs" => cmd_bugs(&args),
         "demo" => cmd_demo(),
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
@@ -141,6 +149,7 @@ fn cmd_sweep(args: &Args) -> i32 {
         threads: args.usize("threads", default_threads()),
         stop_after: args.usize("stop-after", 0),
         verbose: args.has("verbose"),
+        quiet: false,
         base,
     };
     println!(
@@ -196,6 +205,91 @@ fn cmd_shrink(args: &Args) -> i32 {
     }
 }
 
+/// Sweep every injected defect and print how often the checkers catch it, as
+/// the Markdown table BUGS.md carries.
+///
+/// The table is generated rather than typed because a typed one went stale:
+/// it reported `vote-before-sync` caught in 268 of 300 seeds long after a fix
+/// elsewhere had neutralised the defect, and every catch was really a stall.
+/// A measurement that is rerun cannot drift that way.
+fn cmd_bugs(args: &Args) -> i32 {
+    let seeds = args.u64("seeds", 300);
+    let threads = args.usize("threads", default_threads());
+    let measure = |base: SimConfig| {
+        sweep(SweepConfig {
+            base,
+            start_seed: args.u64("from", 1),
+            count: seeds,
+            threads,
+            stop_after: 0,
+            verbose: false,
+            quiet: true,
+        })
+    };
+
+    println!("| Defect | Detection | Caught by |");
+    println!("|---|---|---|");
+    let mut ok = true;
+    for bug in InjectedBug::ALL {
+        let mut base = config(args).with_bug(bug);
+        let mut note = "";
+        if bug == InjectedBug::ConfigBeforeTermCommit && !base.faults.enable_reconfig {
+            // Nothing to break without membership changes.
+            let spares = if base.spares == 0 { 2 } else { base.spares };
+            base = base.with_reconfig(spares);
+            note = " (`--reconfig`)";
+        }
+        let result = measure(base);
+        let caught = result.failures.len();
+        let mut by: Vec<(&str, u64)> = result.by_signature.iter().map(|(k, v)| (*k, *v)).collect();
+        by.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let signatures = by
+            .iter()
+            .map(|(sig, n)| {
+                if by.len() == 1 {
+                    format!("`{sig}`")
+                } else {
+                    format!("`{sig}` ({n})")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "| `{}` — {} | {caught} of {seeds}{note} | {} |",
+            bug.name(),
+            bug.describe(),
+            if signatures.is_empty() {
+                "—"
+            } else {
+                &signatures
+            }
+        );
+        let only_stalls = caught > 0
+            && by
+                .iter()
+                .all(|(sig, _)| *sig == "no_progress_after_recovery");
+        if caught == 0 || only_stalls {
+            ok = false;
+        }
+    }
+
+    let control = measure(config(args).with_bug(InjectedBug::None));
+    println!(
+        "\ncontrol, no defect: {} of {seeds} failed",
+        control.failures.len()
+    );
+    if !control.passed() {
+        print!("{}", control.render());
+        ok = false;
+    }
+    if !ok {
+        println!(
+            "\nFAILED: a defect went unseen or was seen only as a stall, or the control failed"
+        );
+    }
+    i32::from(!ok)
+}
+
 fn cmd_demo() -> i32 {
     println!("== 1. one run in a perfect world ==\n");
     let clean = run(SimConfig::benign(1));
@@ -232,6 +326,7 @@ fn cmd_demo() -> i32 {
         threads: default_threads(),
         stop_after: 0,
         verbose: false,
+        quiet: false,
     });
     print!("{}", result.render());
 

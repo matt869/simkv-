@@ -72,6 +72,7 @@ sim run     [--seed N] [--benign] [--trace debug]   one run, reported in full
 sim sweep   [--seeds N] [--threads N]               many seeds, hunting failures
 sim replay  --seed N [--out trace.txt]              re-run verbosely, verify determinism
 sim shrink  --seed N                                cut a failure to a minimal repro
+sim bugs    [--seeds N]                             detection rate of every injected defect
 sim demo                                            a tour of all of the above
 ```
 

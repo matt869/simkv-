@@ -371,6 +371,7 @@ mod tests {
             threads: sweep::default_threads(),
             stop_after: 1,
             verbose: false,
+            quiet: true,
         });
         result.failures.first().map(|f| (f.seed, f.signature))
     }
