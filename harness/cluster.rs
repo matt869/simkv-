@@ -23,7 +23,8 @@ use checker::invariants::{Invariants, NodeView};
 use checker::linearizability::{Checker, History, Verdict};
 use checker::{Report, Violation};
 use kvstore::log::{recover_hard_state, Entry, RaftLog};
-use kvstore::raft::{RaftMsg, ReadEvent, Role};
+use kvstore::raft::{RaftMsg, RaftStats, ReadEvent, Role};
+use kvstore::server::ServerStats;
 use kvstore::{KvServer, Message};
 use sim_io::{SimIo, FILE_SNAPSHOT_A, FILE_SNAPSHOT_B, FILE_WAL};
 use simcore::faults::{FaultAction, FaultHint};
@@ -37,6 +38,8 @@ const APP_HEAL: u32 = 2;
 const APP_RESTART: u32 = 3;
 const APP_STOP_CLIENTS: u32 = 4;
 const APP_STOP: u32 = 5;
+/// Ask the leader of term `arg` for a membership change, if it still leads.
+const APP_FRESH_RECONFIG: u32 = 6;
 
 pub struct Cluster {
     world: World,
@@ -54,6 +57,9 @@ pub struct Cluster {
     /// Each node's log immediately before it crashed, so recovery can be
     /// checked for having produced a prefix of it.
     pre_crash_log: BTreeMap<NodeId, (Vec<Entry>, u64)>,
+    /// Counters of every incarnation that has crashed. A crash drops the
+    /// server and its counters with it; the run's totals must not.
+    retired: Vec<(RaftStats, ServerStats)>,
     /// Highest term each node has been seen to send a message in.
     acted_term: BTreeMap<NodeId, u64>,
     /// Stand-in log for a node that is currently down.
@@ -156,6 +162,7 @@ impl Cluster {
             invariants: Invariants::new(),
             report: Report::new(),
             pre_crash_log: BTreeMap::new(),
+            retired: Vec::new(),
             acted_term: BTreeMap::new(),
             empty_log: RaftLog::new(),
             truncated_committed_seen,
@@ -399,6 +406,16 @@ impl Cluster {
                 }
             }
             APP_STOP => self.finished = true,
+            APP_FRESH_RECONFIG => {
+                let still_leading = self
+                    .current_leader()
+                    .and_then(|l| self.servers[l.idx()].as_ref())
+                    .is_some_and(|s| s.raft.term() == arg);
+                if still_leading && self.recovered_at.is_none() {
+                    self.stats.fresh_leader_reconfigs += 1;
+                    self.reconfigure();
+                }
+            }
             _ => {}
         }
     }
@@ -494,6 +511,7 @@ impl Cluster {
                     server.raft.durable_index(),
                 ),
             );
+            self.retired.push((server.raft.stats(), server.stats()));
         }
         self.servers[node.idx()] = None;
         self.world.crash_node(node);
@@ -922,13 +940,40 @@ impl Cluster {
                 self.durable_high_water[i] = v.durable_index;
             }
         }
+        let mut fresh_leader = None;
         for v in &views {
             if v.up && v.role == Role::Leader {
+                if v.term > self.max_leader_term {
+                    fresh_leader = Some(v.term);
+                }
                 self.max_leader_term = self.max_leader_term.max(v.term);
             }
         }
         let found = self.invariants.observe(now, &views);
         self.report.extend(found);
+
+        let f = &self.cfg.faults;
+        if let Some(term) = fresh_leader {
+            if f.enable_reconfig
+                && f.fresh_leader_reconfig_ppm > 0
+                && now >= f.window.0
+                && now < f.window.1
+                && self.recovered_at.is_none()
+                && self.world.rng.chance_ppm(f.fresh_leader_reconfig_ppm)
+            {
+                // Anywhere from at once to a few round trips in: some requests
+                // land before the leader's first commit, which a correct leader
+                // must refuse, and some just after, which it must carry out.
+                let delay = self.world.rng.below(20 * simcore::MILLIS);
+                self.world.sched.at(
+                    now + delay,
+                    Event::App {
+                        tag: APP_FRESH_RECONFIG,
+                        arg: term,
+                    },
+                );
+            }
+        }
     }
 
     fn finalize(mut self) -> RunOutcome {
@@ -1050,36 +1095,21 @@ impl Cluster {
         self.stats.ops_abandoned = self.clients.iter().map(|c| c.stats().abandoned).sum();
         self.stats.retries = self.clients.iter().map(|c| c.stats().retries).sum();
         self.stats.max_committed = self.invariants.max_committed();
-        self.stats.elections = self
+        // Every incarnation counts, not just the ones still up at the end:
+        // summing only the survivors used to report a run with seventeen
+        // elections as having had four.
+        let all: Vec<(RaftStats, ServerStats)> = self
             .servers
             .iter()
             .flatten()
-            .map(|s| s.raft.stats().elections_started)
-            .sum();
-        self.stats.leaders_elected = self
-            .servers
-            .iter()
-            .flatten()
-            .map(|s| s.raft.stats().elections_won)
-            .sum();
-        self.stats.truncations = self
-            .servers
-            .iter()
-            .flatten()
-            .map(|s| s.raft.stats().truncations)
-            .sum();
-        self.stats.bad_messages = self
-            .servers
-            .iter()
-            .flatten()
-            .map(|s| s.stats().bad_messages)
-            .sum();
-        self.stats.index_reads = self
-            .servers
-            .iter()
-            .flatten()
-            .map(|s| s.stats().index_reads)
-            .sum();
+            .map(|s| (s.raft.stats(), s.stats()))
+            .chain(self.retired.iter().copied())
+            .collect();
+        self.stats.elections = all.iter().map(|(r, _)| r.elections_started).sum();
+        self.stats.leaders_elected = all.iter().map(|(r, _)| r.elections_won).sum();
+        self.stats.truncations = all.iter().map(|(r, _)| r.truncations).sum();
+        self.stats.bad_messages = all.iter().map(|(_, k)| k.bad_messages).sum();
+        self.stats.index_reads = all.iter().map(|(_, k)| k.index_reads).sum();
         let net = self.world.net_stats();
         self.stats.messages_sent = net.sent;
         self.stats.messages_dropped = net.dropped_loss + net.dropped_partition;

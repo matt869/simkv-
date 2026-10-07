@@ -221,6 +221,14 @@ pub struct RaftConfig {
     /// was removed from the cluster but never heard about it times out forever,
     /// forcing an election with a higher term every few hundred milliseconds.
     pub leader_stickiness: bool,
+    /// Ask whether an election could be won before starting one (Raft thesis
+    /// 9.6). Stickiness stops a server that has lost touch from deposing a
+    /// working leader, but not from inflating its own term every timeout: a
+    /// removed server ran its term to 87 in one run, and any member that had
+    /// just restarted -- and so had no leader to be sticky about -- adopted it
+    /// and turned on the real leader. With pre-vote, a term only moves once a
+    /// majority says an election is warranted.
+    pub pre_vote: bool,
     /// A deliberate defect, for verifying that the checkers work.
     pub bug: InjectedBug,
 }
@@ -234,6 +242,7 @@ impl Default for RaftConfig {
             snapshot_threshold: 400,
             read_mode: ReadMode::ReadIndex,
             leader_stickiness: true,
+            pre_vote: true,
             bug: InjectedBug::None,
         }
     }
@@ -297,6 +306,24 @@ pub enum RaftMsg {
         term: u64,
         seq: u64,
     },
+    /// "Would you vote for me in the term after `term`?" Changes nothing on
+    /// the receiver, and carries the sender's *current* term -- the next one
+    /// is only a proposal, and announcing it would be acting in it.
+    PreVote {
+        term: u64,
+        candidate: NodeId,
+        last_index: u64,
+        last_term: u64,
+    },
+    /// `term` is the voter's own, for the usual step-down rule; `round` is the
+    /// candidate's term the answer is for. They differ whenever the voter is
+    /// behind -- and a voter cannot simply answer in the candidate's term,
+    /// because it has not adopted that term, let alone made it durable.
+    PreVoteResp {
+        term: u64,
+        round: u64,
+        granted: bool,
+    },
 }
 
 impl RaftMsg {
@@ -309,7 +336,9 @@ impl RaftMsg {
             | RaftMsg::InstallSnapshot { term, .. }
             | RaftMsg::InstallSnapshotResp { term, .. }
             | RaftMsg::ReadProbe { term, .. }
-            | RaftMsg::ReadProbeResp { term, .. } => *term,
+            | RaftMsg::ReadProbeResp { term, .. }
+            | RaftMsg::PreVote { term, .. }
+            | RaftMsg::PreVoteResp { term, .. } => *term,
         }
     }
 
@@ -384,6 +413,25 @@ impl RaftMsg {
             RaftMsg::ReadProbeResp { term, seq } => {
                 e.u8(8).u64(*term).u64(*seq);
             }
+            RaftMsg::PreVote {
+                term,
+                candidate,
+                last_index,
+                last_term,
+            } => {
+                e.u8(9)
+                    .u64(*term)
+                    .u32(candidate.0)
+                    .u64(*last_index)
+                    .u64(*last_term);
+            }
+            RaftMsg::PreVoteResp {
+                term,
+                round,
+                granted,
+            } => {
+                e.u8(10).u64(*term).u64(*round).u8(*granted as u8);
+            }
         }
     }
 
@@ -449,6 +497,17 @@ impl RaftMsg {
             8 => RaftMsg::ReadProbeResp {
                 term: d.u64()?,
                 seq: d.u64()?,
+            },
+            9 => RaftMsg::PreVote {
+                term: d.u64()?,
+                candidate: NodeId(d.u32()?),
+                last_index: d.u64()?,
+                last_term: d.u64()?,
+            },
+            10 => RaftMsg::PreVoteResp {
+                term: d.u64()?,
+                round: d.u64()?,
+                granted: d.u8()? != 0,
             },
             t => return Err(DecodeError::BadTag(t)),
         })
@@ -652,6 +711,9 @@ impl Persister {
 pub struct RaftStats {
     pub elections_started: u64,
     pub elections_won: u64,
+    /// Pre-vote rounds started, and how many reached a majority.
+    pub pre_votes_started: u64,
+    pub pre_votes_won: u64,
     pub appends_sent: u64,
     pub entries_replicated: u64,
     pub truncations: u64,
@@ -745,6 +807,8 @@ pub struct Raft {
     leader: Option<NodeId>,
 
     votes: BTreeSet<NodeId>,
+    /// Pre-votes gathered in the round now running, if one is.
+    pre_votes: Option<BTreeSet<NodeId>>,
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
 
@@ -937,6 +1001,7 @@ impl Raft {
             last_applied: snap_index,
             leader: None,
             votes: BTreeSet::new(),
+            pre_votes: None,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
             durable_index,
@@ -1037,13 +1102,9 @@ impl Raft {
         self.persister.in_flight()
     }
 
-    /// Votes from servers in the current membership. A vote from anyone else
-    /// counts for nothing -- a removed server still answering vote requests
-    /// must not help elect a leader of a cluster it is no longer in.
-    fn heard_from_leader_recently(&self, io: &dyn Io) -> bool {
-        if !self.cfg.leader_stickiness {
-            return false;
-        }
+    /// Whether a leader -- this node, or one it has heard from within the
+    /// minimum election timeout -- is evidently in charge.
+    fn leader_is_live(&self, io: &dyn Io) -> bool {
         if self.role == Role::Leader {
             return true;
         }
@@ -1051,6 +1112,14 @@ impl Raft {
             && io.now().saturating_sub(self.last_leader_contact) < self.cfg.election_timeout.0
     }
 
+    /// Leader stickiness: ignore vote requests while a leader is live.
+    fn heard_from_leader_recently(&self, io: &dyn Io) -> bool {
+        self.cfg.leader_stickiness && self.leader_is_live(io)
+    }
+
+    /// Votes from servers in the current membership. A vote from anyone else
+    /// counts for nothing -- a removed server still answering vote requests
+    /// must not help elect a leader of a cluster it is no longer in.
     fn member_votes(&self) -> usize {
         self.votes
             .iter()
@@ -1123,6 +1192,17 @@ impl Raft {
                 self.on_read_probe(io, from, term, leader, seq)
             }
             RaftMsg::ReadProbeResp { term, seq } => self.on_read_probe_resp(io, from, term, seq),
+            RaftMsg::PreVote {
+                term,
+                candidate,
+                last_index,
+                last_term,
+            } => self.on_pre_vote(io, from, term, candidate, last_index, last_term),
+            RaftMsg::PreVoteResp {
+                term,
+                round,
+                granted,
+            } => self.on_pre_vote_resp(io, from, term, round, granted),
         }
     }
 
@@ -1144,7 +1224,11 @@ impl Raft {
                     self.reset_election_timer(io);
                     return;
                 }
-                self.become_candidate(io);
+                if self.cfg.pre_vote {
+                    self.start_pre_vote(io);
+                } else {
+                    self.become_candidate(io);
+                }
             }
             TIMER_HEARTBEAT => {
                 if !self.heartbeat_timer.fired() {
@@ -1562,7 +1646,116 @@ impl Raft {
 
     // ---- elections --------------------------------------------------------
 
+    /// Ask a majority whether an election is warranted before starting one.
+    ///
+    /// Nothing here touches the term, the vote or the disk: a server that has
+    /// merely lost touch -- partitioned away, or removed and never told -- can
+    /// time out forever without its term moving at all.
+    fn start_pre_vote(&mut self, io: &mut dyn Io) {
+        self.role = Role::Follower;
+        self.leader = None;
+        self.votes.clear();
+        let mut granted = BTreeSet::new();
+        granted.insert(self.id);
+        self.pre_votes = Some(granted);
+        self.stats.pre_votes_started += 1;
+        self.reset_election_timer(io);
+        if self.member_pre_votes() >= self.quorum() {
+            // A cluster of one has nobody to ask.
+            self.pre_votes = None;
+            self.stats.pre_votes_won += 1;
+            self.become_candidate(io);
+            return;
+        }
+        io.trace(
+            Level::Debug,
+            "raft",
+            format!("asking for pre-votes for term {}", self.term + 1),
+        );
+        let msg = RaftMsg::PreVote {
+            term: self.term,
+            candidate: self.id,
+            last_index: self.log.last_index(),
+            last_term: self.log.last_term(),
+        };
+        for p in self.peers() {
+            self.send(io, p, msg.clone());
+        }
+    }
+
+    fn member_pre_votes(&self) -> usize {
+        self.pre_votes
+            .as_ref()
+            .map_or(0, |v| v.iter().filter(|n| self.members.contains(n)).count())
+    }
+
+    fn on_pre_vote(
+        &mut self,
+        io: &mut dyn Io,
+        from: NodeId,
+        term: u64,
+        _candidate: NodeId,
+        last_index: u64,
+        last_term: u64,
+    ) {
+        // The same tests a real vote would face, plus one: no live leader. The
+        // receiver's own state is left exactly as it was, whatever the answer.
+        let granted = term >= self.term
+            && self.log.is_up_to_date(last_index, last_term)
+            && !self.leader_is_live(io);
+        self.send(
+            io,
+            from,
+            RaftMsg::PreVoteResp {
+                term: self.term,
+                round: term,
+                granted,
+            },
+        );
+    }
+
+    fn on_pre_vote_resp(
+        &mut self,
+        io: &mut dyn Io,
+        from: NodeId,
+        term: u64,
+        round: u64,
+        granted: bool,
+    ) {
+        if term > self.term {
+            // Behind: catch up on the term, quietly, instead of campaigning.
+            self.pre_votes = None;
+            self.step_down_and_persist(io, term);
+            return;
+        }
+        // Matched on the round, not the voter's term. Matching on the voter's
+        // term threw away every yes from a server behind on terms -- such as
+        // one just added, still at term 0 -- and seed 33976 sat with two of
+        // the three pre-votes it needed for the rest of the run: one server
+        // short, forever, while the real vote would have succeeded at once.
+        if round != self.term || self.leader.is_some() {
+            // A stale answer, or a leader has been heard from since the round
+            // began -- an election now would only depose it.
+            if self.leader.is_some() {
+                self.pre_votes = None;
+            }
+            return;
+        }
+        let Some(votes) = self.pre_votes.as_mut() else {
+            return;
+        };
+        if granted {
+            votes.insert(from);
+            if self.member_pre_votes() >= self.quorum() {
+                self.pre_votes = None;
+                self.stats.pre_votes_won += 1;
+                self.become_candidate(io);
+            }
+        }
+    }
+
     fn become_candidate(&mut self, io: &mut dyn Io) {
+        self.pre_votes = None;
         self.term += 1;
         self.voted_for = Some(self.id);
         self.role = Role::Candidate;
@@ -2744,6 +2937,17 @@ mod tests {
                 seq: 99,
             },
             RaftMsg::ReadProbeResp { term: 4, seq: 99 },
+            RaftMsg::PreVote {
+                term: 6,
+                candidate: NodeId(2),
+                last_index: 30,
+                last_term: 6,
+            },
+            RaftMsg::PreVoteResp {
+                term: 6,
+                round: 7,
+                granted: true,
+            },
             RaftMsg::InstallSnapshot {
                 term: 5,
                 leader: NodeId(2),

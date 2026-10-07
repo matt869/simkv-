@@ -178,6 +178,8 @@ pub struct RunStats {
     /// progress, or no entry of its term committed yet).
     pub reconfigs: u64,
     pub reconfigs_refused: u64,
+    /// Membership changes requested of a leader moments after it was elected.
+    pub fresh_leader_reconfigs: u64,
 }
 
 /// The result of one run.
@@ -211,9 +213,17 @@ impl RunOutcome {
 
     pub fn summary(&self) -> String {
         let s = &self.stats;
+        let membership = if s.reconfigs + s.reconfigs_refused > 0 {
+            format!(
+                " | {} reconfigs ({} refused, {} asked of new leaders)",
+                s.reconfigs, s.reconfigs_refused, s.fresh_leader_reconfigs
+            )
+        } else {
+            String::new()
+        };
         format!(
             "seed {:>6} | {:>5} ops ({} abandoned, {} index reads) | {} committed | \
-             {} elections, {} leaders | {} crashes, {} partitions | {} events | fp {} | {}",
+             {} elections, {} leaders | {} crashes, {} partitions{} | {} events | fp {} | {}",
             self.seed,
             s.ops_completed,
             s.ops_abandoned,
@@ -223,6 +233,7 @@ impl RunOutcome {
             s.leaders_elected,
             s.crashes,
             s.partitions,
+            membership,
             s.events,
             self.fingerprint,
             if self.failed() {
@@ -425,13 +436,16 @@ mod tests {
 
     /// A seed pinned to the fault model it was found under.
     ///
-    /// Every fault added later reshuffles every seed's schedule, and a
-    /// regression seed that no longer reaches its bug's state passes whether
-    /// the fix is there or not. Faults added after a seed was found are
-    /// switched off here, so each one keeps reproducing its own bug.
+    /// Every fault or protocol change added later reshuffles every seed's
+    /// schedule, and a regression seed that no longer reaches its bug's state
+    /// passes whether the fix is there or not. Anything added after these
+    /// seeds were found is switched off here, so each one keeps reproducing its
+    /// own bug.
     fn regression_seed(seed: u64) -> SimConfig {
         let mut cfg = SimConfig::with_seed(seed);
         cfg.faults.peer_isolate_weight = 0;
+        cfg.faults.fresh_leader_reconfig_ppm = 0;
+        cfg.raft.pre_vote = false;
         cfg
     }
 
@@ -502,6 +516,19 @@ mod tests {
         // term-only send guard let the repeat grant out before the vote itself
         // reached disk -- a crash there would forget a vote already cast.
         let mut cfg = regression_seed(480).with_reconfig(2);
+        cfg.normalise();
+        let out = run(cfg);
+        assert!(!out.failed(), "{}", out.detail());
+    }
+
+    #[test]
+    fn a_pre_vote_from_a_server_behind_on_terms_still_counts() {
+        // A newly added server, still at term 0, granted a pre-vote for term 2
+        // and answered in its own term. The candidate matched answers on the
+        // voter's term, discarded the yes as stale, and stayed one pre-vote
+        // short of a majority for the rest of the run: 33 operations instead
+        // of 1094. Found under the current fault model, so not pinned.
+        let mut cfg = SimConfig::with_seed(33976).with_reconfig(2);
         cfg.normalise();
         let out = run(cfg);
         assert!(!out.failed(), "{}", out.detail());

@@ -114,7 +114,7 @@ pub fn describe(cfg: &SimConfig) -> String {
     format!(
         "  seed={} servers={} clients={} keys={} duration={}ms settle={}ms\n  \
          faults=[{}]\n  net=[{}]\n  disk=[{}]\n  workload=[{}]\n  \
-         raft=[reads={} batch={} snapshot-every={}] membership=[spares={} reconfig={}]",
+         raft=[reads={} batch={} snapshot-every={} pre-vote={}] membership=[spares={} reconfig={}]",
         cfg.seed,
         cfg.servers,
         cfg.clients,
@@ -128,6 +128,7 @@ pub fn describe(cfg: &SimConfig) -> String {
         cfg.raft.read_mode.name(),
         cfg.raft.max_batch,
         cfg.raft.snapshot_threshold,
+        cfg.raft.pre_vote,
         cfg.spares,
         cfg.faults.enable_reconfig,
     )
@@ -269,6 +270,20 @@ fn candidates() -> Vec<Candidate> {
             (cfg.faults.enable_partitions && cfg.faults.peer_isolate_weight > 0).then(|| {
                 let mut n = cfg.clone();
                 n.faults.peer_isolate_weight = 0;
+                n
+            })
+        }),
+        c("elections without pre-vote", |cfg| {
+            cfg.raft.pre_vote.then(|| {
+                let mut n = cfg.clone();
+                n.raft.pre_vote = false;
+                n
+            })
+        }),
+        c("membership changes only at random times", |cfg| {
+            (cfg.faults.enable_reconfig && cfg.faults.fresh_leader_reconfig_ppm > 0).then(|| {
+                let mut n = cfg.clone();
+                n.faults.fresh_leader_reconfig_ppm = 0;
                 n
             })
         }),
@@ -437,6 +452,7 @@ mod tests {
         cfg.workload.delete_weight = 0;
         cfg.workload.read_weight = 0;
         cfg.raft.read_mode = ReadMode::Log;
+        cfg.raft.pre_vote = false;
         for c in candidates() {
             assert!(
                 (c.apply)(&cfg).is_none(),

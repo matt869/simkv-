@@ -139,13 +139,13 @@ correction below).
 | Defect | Detection | Caught by |
 |---|---|---|
 | `ack-before-sync` — acknowledges entries before they are durable | 300 of 300 | `ack_beyond_durable` |
-| `commit-any-term` — commits by counting replicas of any term | 215 of 300 | `commit_of_foreign_term` |
-| `vote-before-sync` — votes before the vote is durable | 143 of 300 | `vote_beyond_durable` (140), `durable_term_lost` (3) |
+| `commit-any-term` — commits by counting replicas of any term | 200 of 300 | `commit_of_foreign_term` |
+| `vote-before-sync` — votes before the vote is durable | 128 of 300 | `vote_beyond_durable` |
 | `no-dedup` — applies retried client requests twice | 299 of 300 | `linearizability` |
 | `truncate-on-any-append` — truncates the log on any mismatch in length | 300 of 300 | `commit_beyond_log` |
 | `read-without-quorum` — serves reads without confirming leadership | 300 of 300 | `read_unconfirmed` |
-| `read-before-term-commit` — serves reads before committing an entry of its own term | 104 of 300 | `read_before_term_commit` |
-| `config-before-term-commit` — changes membership before committing an entry of its own term | 21 of 300 (`--reconfig`) | `config_before_term_commit` |
+| `read-before-term-commit` — serves reads before committing an entry of its own term | 81 of 300 | `read_before_term_commit` |
+| `config-before-term-commit` — changes membership before committing an entry of its own term | 196 of 300 (`--reconfig`) | `config_before_term_commit` |
 
 There is no longer a defect on this list the harness cannot see, and the test
 that asserts it is strict: no known-gap escape hatch, and — since the
@@ -421,7 +421,8 @@ their own: `config_before_term_commit` (a leader changed the membership before
 committing an entry of its own term — the bug in the original single-server
 algorithm, fixed on raft-dev in 2015) and `concurrent_config_change` (a second
 change proposed while one is still uncommitted). The matching defect,
-`config-before-term-commit`, is caught in about 1 reconfiguring seed in 14.
+`config-before-term-commit`, was caught in about 1 reconfiguring seed in 14 — see
+section 11 for how that became 196 in 300.
 
 ### A removed server that never finds out
 
@@ -524,9 +525,111 @@ seeds to the fault model they were found under.
 
 ---
 
+## 11. Pre-vote, and a summary that had always undercounted
+
+### The counter that lost every crash
+
+Every run summary reports elections, leaders, truncations and malformed
+messages. They were summed over the servers alive at the end of the run — and
+a crash drops the server, counters and all. Seed 392 was reported as "1
+election, 1 leader"; it had 25 and 15. No check depended on these numbers,
+which is exactly why nobody noticed: the harness carefully verifies what the
+store does and had never verified what it says about itself. Crashed
+incarnations' counters are now kept and added in.
+
+### What the corrected numbers showed
+
+With membership changes on, runs were starting 45 to 146 elections to elect 10
+to 13 leaders. In seed 4, one server started 69 of them: removed at 11.5s, it
+never received its removal, and campaigned until the end of the run, pushing
+its term to 87. Leader stickiness (section 9) kept it from deposing a healthy
+leader, but not from doing harm. A member that has just restarted has no leader
+to be sticky about, so it adopts the inflated term and then rejects the real
+leader; and if the removed server is ever added back, its first reply forces
+the leader to step down. Seed 4 completed 666 operations with membership
+changes, against 835 without.
+
+The fix is pre-vote (thesis §9.6): before touching its term, a would-be
+candidate asks whether it could win. A server says yes only if the candidate's
+log is up to date and it has not heard from a leader within the minimum
+election timeout — and answering changes nothing on the server, including its
+term. A server that has lost touch can now time out forever without its term
+moving. `--no-prevote` turns it off:
+
+| 1000 seeds | without | with | |
+|---|---|---|---|
+| membership changes | 910,469 ops | 1,022,642 | +12% |
+| default | 979,573 | 1,043,802 | +7% |
+| membership changes, no stickiness | 746,540 | 1,022,146 | +37% |
+
+Elections in those five seeds fell from 45–146 to 9–16, almost all of which
+now elect someone. With pre-vote, stickiness no longer makes a measurable
+difference.
+
+The cost is recorded too: three defects that need an election to go wrong in
+are now caught a little less often — `commit-any-term` 215 → 200,
+`vote-before-sync` 143 → 128, `read-before-term-commit` 104 → 81 — because a
+healthier cluster holds fewer of them.
+
+### Asking new leaders for membership changes
+
+`config-before-term-commit` was caught in 21 of 300 seeds. The rule check was
+there; the moment was not. A leader can only break "commit in your own term
+first" in the few milliseconds between winning and committing its no-op, and
+changes requested at random times almost never land there. In practice that is
+precisely when an operator acts: a server fails, an election follows, and the
+replacement is requested of whoever won. The driver now does the same: with
+membership changes on, 30% of new leaders are asked for one within 20ms of
+winning — some before their first commit, which a correct leader must refuse,
+and some just after, which it must carry out. 21 → 204 of 300 before pre-vote,
+196 after.
+
+Both changes reshuffle every seed, so both have a switch
+(`--no-fresh-leader-reconfig`, `--no-prevote`) and the regression seeds pin
+both off, like peer isolation in section 10.
+
+### Bug 11: a yes thrown away for being in the wrong term
+
+Pre-vote passed fourteen thousand seeds and then wedged seed 33976 for good,
+in a 12,000-seed hunt run before committing it: one election in the whole run,
+33 operations, `no_progress_after_recovery`.
+
+The leader's last membership change removed itself, and only it ever received
+that entry. Everyone else was still on the configuration before — four
+servers, a quorum of three. The old leader had the longest log, so it rightly
+refused every pre-vote. The two survivors granted each other's. The fourth
+member had just been added, still had an empty log and was still at term 0,
+and it granted too, answering in its own term, as it must: it cannot speak in a
+term it has not made durable. The candidate, at term 1, matched answers on the
+voter's term, saw a 0, and discarded the yes as stale. Two of the three
+pre-votes it needed, every round, forever — where an ordinary election would
+have succeeded at once, because a real vote request makes the voter adopt the
+term.
+
+The reply now names the round it answers separately from the voter's term, and
+the candidate matches on the round. Seed 33976 completes 1094 operations, with
+8 elections electing 8 leaders.
+
+What made it findable is worth noting: membership changes, a self-removal that
+reached only the leader, and a fresh member still at term 0. No unit test of
+pre-vote would have set that up, and the 14,800 seeds of the ordinary matrix
+did not either. The hunt over fresh seeds did.
+
+---
+
 ## Current status
 
 ```
+11000 fresh seeds (30001+) with pre-vote: 60s fault windows, reconfiguring
+  with snapshots every 5 entries, no stickiness → 267M events; found bug 11,
+  and no failures after the fix
+23300 seeds across thirteen configurations with pre-vote, those 11000
+  included → no failures
+32000 seeds across seven harsher ones, just before pre-vote (60s windows,
+  seeds 10001+,
+  5 servers reconfiguring for 60s, snapshot every 3 entries with one-entry
+  batches, one key and eight clients, majority loss while reconfiguring)
+  → 638M events, no failures
 14600 seeds across twelve configurations, with peer isolation and the new
   read rules → no failures (the eleven below, plus a single-node cluster)
 16500 seeds across eleven configurations before it → no failures

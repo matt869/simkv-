@@ -84,7 +84,7 @@ batches make followers acknowledge at an old-term index), `--snapshot-threshold
 N` (low values force constant compaction and snapshot transfer),
 `--reads log|index`, `--quorum-loss`, `--reconfig` (add and remove servers
 while faults are injected; `--spares N` sets how many slots sit outside the
-initial membership), `--no-stickiness`, and `--bug NAME` (eight deliberate
+initial membership), `--no-stickiness`, `--no-prevote`, and `--bug NAME` (eight deliberate
 defects, every one of which the checkers catch by a safety rule, not a stall).
 
 Exit status is 0 when nothing failed and 1 when something did, so a sweep drops
@@ -126,6 +126,13 @@ from a leader within the minimum election timeout ignores vote requests, even
 at higher terms. Without it, a removed server that never learns of its removal
 times out and disrupts the cluster forever — over 400 reconfiguring seeds,
 stickiness completes 16% more operations.
+
+**Pre-vote** (thesis §9.6) is on by default too: before touching its term, a
+would-be candidate asks whether it could win, and servers that are still
+hearing from a leader say no. A server that has lost touch — partitioned, or
+removed and never told — can then time out forever without its term moving.
+It completes 7% more operations by default, and 12% more with membership
+changes. `--no-prevote` turns it off.
 
 Deliberately **not** implemented: joint consensus, and lease-based reads —
 which trade the probe round for a dependence on bounded clock drift, in a

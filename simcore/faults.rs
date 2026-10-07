@@ -102,6 +102,15 @@ pub struct FaultConfig {
     pub unsynced_bias_ppm: u32,
     /// Change the cluster membership while everything else is going wrong.
     pub enable_reconfig: bool,
+    /// With membership changes on, how often a newly elected leader is asked
+    /// for one within moments of winning.
+    ///
+    /// That is when an operator acts in practice: a server fails, an election
+    /// follows, and the replacement is requested of whoever won. It is also the
+    /// only moment the "commit in your own term first" rule can be broken, and
+    /// changes arriving at random times almost never land in it. Zero leaves the
+    /// random stream untouched.
+    pub fresh_leader_reconfig_ppm: u32,
 }
 
 impl Default for FaultConfig {
@@ -130,6 +139,7 @@ impl Default for FaultConfig {
             leader_bias_ppm: 300_000,
             unsynced_bias_ppm: 500_000,
             enable_reconfig: false,
+            fresh_leader_reconfig_ppm: 300_000,
         }
     }
 }

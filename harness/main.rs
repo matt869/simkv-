@@ -63,6 +63,11 @@ COMMON OPTIONS:
     --no-peer-isolation Never cut a server off from its peers while leaving its
                         clients connected (the fault model before it existed;
                         reproduces seeds found under that model)
+    --no-fresh-leader-reconfig
+                        With --reconfig, only request membership changes at
+                        random times, never just after an election
+    --no-prevote        Start elections without asking first (disables Raft
+                        thesis 9.6)
     --no-stickiness     Let servers adopt a higher term even while hearing from
                         a leader (disables Raft thesis 4.2.3)
     --reads MODE        index (default): ReadIndex, no log write per read;
@@ -371,6 +376,12 @@ fn config(args: &Args) -> SimConfig {
     }
     if args.has("no-peer-isolation") {
         cfg.faults.peer_isolate_weight = 0;
+    }
+    if args.has("no-prevote") {
+        cfg.raft.pre_vote = false;
+    }
+    if args.has("no-fresh-leader-reconfig") {
+        cfg.faults.fresh_leader_reconfig_ppm = 0;
     }
     if let Some(mode) = args.get("reads") {
         match ReadMode::parse(mode) {
