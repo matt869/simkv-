@@ -60,6 +60,9 @@ COMMON OPTIONS:
     --reconfig          Add and remove servers while faults are injected
                         (implies --spares 2 unless given)
     --spares N          Extra server slots outside the initial membership
+    --no-peer-isolation Never cut a server off from its peers while leaving its
+                        clients connected (the fault model before it existed;
+                        reproduces seeds found under that model)
     --no-stickiness     Let servers adopt a higher term even while hearing from
                         a leader (disables Raft thesis 4.2.3)
     --reads MODE        index (default): ReadIndex, no log write per read;
@@ -365,6 +368,9 @@ fn config(args: &Args) -> SimConfig {
     }
     if args.has("no-stickiness") {
         cfg.raft.leader_stickiness = false;
+    }
+    if args.has("no-peer-isolation") {
+        cfg.faults.peer_isolate_weight = 0;
     }
     if let Some(mode) = args.get("reads") {
         match ReadMode::parse(mode) {

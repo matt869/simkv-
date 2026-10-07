@@ -67,6 +67,9 @@ pub fn describe(cfg: &SimConfig) -> String {
     }
     if f.enable_partitions {
         faults.push("partitions");
+        if f.peer_isolate_weight > 0 {
+            faults.push("peer-isolation");
+        }
     }
     if f.enable_clock_skew {
         faults.push("clock-skew");
@@ -259,6 +262,13 @@ fn candidates() -> Vec<Candidate> {
             (cfg.settle > 5 * simcore::SECONDS).then(|| {
                 let mut n = cfg.clone();
                 n.settle = (cfg.settle / 2).max(5 * simcore::SECONDS);
+                n
+            })
+        }),
+        c("no peer isolation (cut from servers, not clients)", |cfg| {
+            (cfg.faults.enable_partitions && cfg.faults.peer_isolate_weight > 0).then(|| {
+                let mut n = cfg.clone();
+                n.faults.peer_isolate_weight = 0;
                 n
             })
         }),

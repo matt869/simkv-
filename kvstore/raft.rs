@@ -675,8 +675,15 @@ pub struct RaftStats {
 /// What happened to a ReadIndex read, for the checker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadEvent {
-    /// Accepted, and will observe everything at or below `read_index`.
-    Requested { id: u64, read_index: u64 },
+    /// Accepted by the leader of `term`, and will observe everything at or
+    /// below `read_index`. Only probe replies carrying `seq` or later can
+    /// confirm it: those are the probes sent after it arrived.
+    Requested {
+        id: u64,
+        read_index: u64,
+        term: u64,
+        seq: u64,
+    },
     /// Answered from the state machine.
     Served { id: u64 },
 }
@@ -1425,6 +1432,8 @@ impl Raft {
         self.read_events.push(ReadEvent::Requested {
             id,
             read_index: self.commit_index,
+            term: self.term,
+            seq: self.read_seq,
         });
         io.observe("read_index", &[id, self.commit_index]);
         if !confirmed {

@@ -27,7 +27,9 @@ cargo run --release -p harness --bin sim -- demo
 
 - **Network** — messages are delayed on a long-tailed distribution, dropped,
   duplicated, reordered (naturally, because every copy draws its own latency),
-  corrupted a bit at a time, and cut by *directional* partitions.
+  corrupted a bit at a time, and cut by *directional* partitions — including
+  the split that makes stale reads possible, where a server loses its peers but
+  keeps its clients.
 - **Disk** — a completed write is not a durable write. Each file has a page
   cache and a durable image; only a completed `fsync` moves data between them. A
   crash independently loses, tears, or reorders every unsynced write, which
@@ -58,8 +60,9 @@ back, so a correct cluster has to demonstrably recover — otherwise "wedged" an
 - **The rules themselves, not just their consequences** — a follower may never
   acknowledge more than it has synced; a vote may never be granted before it is
   on disk; a leader may only commit onto an entry of its own term, and may only
-  change the membership once it has, one server at a time; a read may never be
-  served at an index below something already committed. Waiting for the *damage* these cause needs a long run of bad luck;
+  change the membership once it has, one server at a time; a read may only be
+  accepted at an index from the leader's own term, and only answered once a
+  quorum has replied to a probe sent after it arrived. Waiting for the *damage* these cause needs a long run of bad luck;
   checking the rule fires on the first offending event.
 - **Efficiency** — a message storm breaks no safety property, so nothing above
   can see one. Healthy runs cost about 15 events per operation; a run far above

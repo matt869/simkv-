@@ -139,13 +139,13 @@ correction below).
 | Defect | Detection | Caught by |
 |---|---|---|
 | `ack-before-sync` — acknowledges entries before they are durable | 300 of 300 | `ack_beyond_durable` |
-| `commit-any-term` — commits by counting replicas of any term | 216 of 300 | `commit_of_foreign_term` |
-| `vote-before-sync` — votes before the vote is durable | 142 of 300 | `vote_beyond_durable` (138), `durable_term_lost` (4) |
+| `commit-any-term` — commits by counting replicas of any term | 215 of 300 | `commit_of_foreign_term` |
+| `vote-before-sync` — votes before the vote is durable | 143 of 300 | `vote_beyond_durable` (140), `durable_term_lost` (3) |
 | `no-dedup` — applies retried client requests twice | 299 of 300 | `linearizability` |
-| `truncate-on-any-append` — truncates the log on any mismatch in length | 300 of 300 | `commit_beyond_log` (298), `leader_completeness` (2) |
-| `read-without-quorum` — serves reads without confirming leadership | 17 of 300 | `stale_read_index` |
-| `read-before-term-commit` — serves reads before committing an entry of its own term | 21 of 300 | `stale_read_index` |
-| `config-before-term-commit` — changes membership before committing an entry of its own term | 24 of 300 (`--reconfig`) | `config_before_term_commit` |
+| `truncate-on-any-append` — truncates the log on any mismatch in length | 300 of 300 | `commit_beyond_log` |
+| `read-without-quorum` — serves reads without confirming leadership | 300 of 300 | `read_unconfirmed` |
+| `read-before-term-commit` — serves reads before committing an entry of its own term | 104 of 300 | `read_before_term_commit` |
+| `config-before-term-commit` — changes membership before committing an entry of its own term | 21 of 300 (`--reconfig`) | `config_before_term_commit` |
 
 There is no longer a defect on this list the harness cannot see, and the test
 that asserts it is strict: no known-gap escape hatch, and — since the
@@ -421,7 +421,7 @@ their own: `config_before_term_commit` (a leader changed the membership before
 committing an entry of its own term — the bug in the original single-server
 algorithm, fixed on raft-dev in 2015) and `concurrent_config_change` (a second
 change proposed while one is still uncommitted). The matching defect,
-`config-before-term-commit`, is caught in 24 of 300 reconfiguring seeds.
+`config-before-term-commit`, is caught in about 1 reconfiguring seed in 14.
 
 ### A removed server that never finds out
 
@@ -476,16 +476,67 @@ one window is a long coincidence. The rule check saw it on its first sweep.
 
 ---
 
+## 10. Reads: from one seed in fifteen to every seed
+
+The two ReadIndex defects were the last on the table still caught by their
+damage: `stale_read_index` fires only when a read is answered at an index below
+something already committed, which needs another leader to have committed
+something first. 17 and 21 seeds in 300. The fix was the same as for
+`ack-before-sync` and `commit-any-term`: state each condition of the protocol as
+a rule and check it at the moment of the act.
+
+- `read_before_term_commit`: when a leader accepts a read, the entry at its read
+  index must be from the leader's own term. Until it is, its commit index can sit
+  below entries an earlier leader committed. 21 → **104 of 300**.
+- `read_unconfirmed`: when a read is answered, a quorum of the leader's
+  configuration must have replied to a probe sent after the read arrived. The
+  harness counts the replies from *delivered messages*, and against the
+  leader's membership at the moment each reply lands — so a configuration change
+  in the middle of a read cannot make a valid confirmation look short.
+  17 → **300 of 300**.
+
+A third rule, `read_by_deposed_leader`, came first and is kept as a second
+opinion that does not depend on the probe protocol: a read accepted after a
+higher term already had a leader can never be confirmed, so serving it is
+always wrong. It moved detection only from 17 to 19, which was itself
+informative — it meant deposed leaders were almost never being *asked*
+anything.
+
+That was the fault model. A full isolation cuts a node off from its clients as
+well as its peers, so a leader cut off and replaced never gets the chance to
+answer a read it should not. The split that causes stale reads in practice is
+the other one: the server network is down, the client network is fine. That is
+now a fault of its own, `IsolateFromPeers`, aimed at the leader on the same bias
+as the rest; with it, `read_by_deposed_leader` alone reaches 30 of 300.
+
+Aiming peer isolation at the leader 80% of the time instead of 30% made things
+*worse* (23), because a client attached to a cut-off leader stalls on its first
+write, usually before a new leader is even elected. Hunting for a schedule
+where the damage shows up is a long game; `read_unconfirmed` does not need the
+damage at all.
+
+A new fault reshuffles every seed's schedule, which would quietly turn the
+regression tests into tests of nothing: a seed that no longer reaches its
+bug's state passes with or without the fix. The new fault has a weight of its
+own and is left off the menu entirely at zero, so `--no-peer-isolation`
+reproduces the old schedules bit for bit, and the regression tests pin their
+seeds to the fault model they were found under.
+
+---
+
 ## Current status
 
 ```
-16500 seeds across eleven configurations → no failures, no false positives
+14600 seeds across twelve configurations, with peer isolation and the new
+  read rules → no failures (the eleven below, plus a single-node cluster)
+16500 seeds across eleven configurations before it → no failures
   (default; fault-free; --snapshot-threshold 5 + batch 2; 5 servers +
    threshold 3; 7 servers; and with membership changes: default, 5 servers,
    threshold 5 + batch 2, majority-failure, reads through the log,
    no stickiness)
-All eight injected defects caught, every one by a safety rule rather than a
-  stall; the test that asserts it has no known-gap escape hatch
+All eight injected defects caught by a safety check, never by a stall --
+  seven of them by a rule check at the moment of the act, three in every seed; the test that asserts it has no
+  known-gap escape hatch, and `sim bugs` regenerates the table in CI
 3000 seeds adding and removing servers under crashes + partitions + clock
   skew + torn writes → 59.2M events, 2.8M operations checked, no failures
 ```

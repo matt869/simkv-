@@ -68,9 +68,14 @@ pub struct Cluster {
     /// match_index above it is proof the node acknowledged data it had never
     /// synced -- with no false positives.
     durable_high_water: Vec<u64>,
-    /// (node, read id) -> (its read index, the highest index committed anywhere
-    /// in the cluster when the read arrived).
-    pending_reads: BTreeMap<(NodeId, u64), (u64, u64)>,
+    /// (node, read id) -> the read as it was accepted.
+    pending_reads: BTreeMap<(NodeId, u64), PendingRead>,
+    /// The highest term in which any node has been seen acting as leader.
+    max_leader_term: u64,
+    /// (leader, term) -> for each peer, the highest read-probe sequence number
+    /// it has been seen answering in that term. Built from delivered messages,
+    /// not from anything the leader says about itself.
+    probe_acks: BTreeMap<(NodeId, u64), BTreeMap<NodeId, u64>>,
 
     events: u64,
     incomplete: bool,
@@ -78,6 +83,22 @@ pub struct Cluster {
     recovered_at: Option<Nanos>,
     completed_at_recovery: usize,
     stats: RunStats,
+}
+
+/// A ReadIndex read between being accepted and being served.
+#[derive(Clone, Copy, Debug)]
+struct PendingRead {
+    read_index: u64,
+    /// The term of the leader that accepted it.
+    term: u64,
+    /// The highest index committed anywhere when it arrived.
+    committed_before: u64,
+    /// The highest term anyone had been leader in when it arrived.
+    leader_term_before: u64,
+    /// The leader's probe sequence number when it arrived.
+    seq: u64,
+    /// Whether delivered probe replies have completed a quorum for it yet.
+    confirmed: bool,
 }
 
 impl Cluster {
@@ -140,6 +161,8 @@ impl Cluster {
             truncated_committed_seen,
             durable_high_water: vec![0; cfg_servers],
             pending_reads: BTreeMap::new(),
+            max_leader_term: 0,
+            probe_acks: BTreeMap::new(),
             events: 0,
             incomplete: false,
             finished: false,
@@ -317,6 +340,9 @@ impl Cluster {
             return;
         }
         self.stats.messages_delivered += 1;
+        if !self.is_client(to) && !self.is_client(from) {
+            self.note_probe_ack(from, to, payload);
+        }
         if self.is_client(to) {
             let i = to.idx() - self.slots;
             let mut io = SimIo::new(&mut self.world, to);
@@ -404,6 +430,18 @@ impl Cluster {
                 self.world.net.isolate(node);
                 self.stats.partitions += 1;
                 self.world.observe(Some(node), "isolate", &[]);
+                self.schedule_heal();
+            }
+            FaultAction::IsolateFromPeers(node) => {
+                for j in 0..self.slots as u32 {
+                    let peer = NodeId(j);
+                    if peer != node {
+                        self.world.net.cut(node, peer);
+                        self.world.net.cut(peer, node);
+                    }
+                }
+                self.stats.partitions += 1;
+                self.world.observe(Some(node), "isolate_from_peers", &[]);
                 self.schedule_heal();
             }
             FaultAction::SlowLink(a, b) => self.world.net.slow_link(a, b),
@@ -644,26 +682,146 @@ impl Cluster {
     /// "Committed anywhere" is read from the invariant checker's record, which
     /// reflects the cluster as of the previous event -- i.e. before this read
     /// arrived, which is exactly the right moment.
+    /// Record a read-probe reply as it reaches its leader, and mark every read
+    /// it completes a quorum for.
+    ///
+    /// The membership used is the leader's at the moment the reply lands --
+    /// the same one it will count against -- so a configuration change between
+    /// a read arriving and being served cannot make a valid confirmation look
+    /// short.
+    fn note_probe_ack(&mut self, from: NodeId, to: NodeId, payload: &[u8]) {
+        let Ok(Message::Raft(RaftMsg::ReadProbeResp { term, seq })) = Message::decode(payload)
+        else {
+            return;
+        };
+        let Some(server) = self.servers[to.idx()].as_ref() else {
+            return;
+        };
+        let acks = self.probe_acks.entry((to, term)).or_default();
+        let e = acks.entry(from).or_insert(0);
+        *e = (*e).max(seq);
+        let members = server.raft.members();
+        let quorum = members.len() / 2 + 1;
+        let own = usize::from(members.contains(&to));
+        for ((node, _), read) in self.pending_reads.iter_mut() {
+            if *node != to || read.term != term || read.confirmed {
+                continue;
+            }
+            let n = acks
+                .iter()
+                .filter(|(peer, s)| members.contains(peer) && **s >= read.seq)
+                .count();
+            if own + n >= quorum {
+                read.confirmed = true;
+            }
+        }
+    }
+
     fn check_reads(&mut self) {
         let now = self.world.now();
         let committed_before = self.invariants.max_committed();
         for i in 0..self.slots {
             let node = NodeId(i as u32);
-            let events = match self.servers[i].as_mut() {
-                Some(s) => s.raft.take_read_events(),
-                None => continue,
+            // Each event with the term of the entry at its read index, looked
+            // up now, while this node's log is still the one the read saw.
+            let Some(s) = self.servers[i].as_mut() else {
+                continue;
             };
-            for ev in events {
+            let sole_member = s.raft.members() == [node];
+            let evs = s.raft.take_read_events();
+            let events: Vec<(ReadEvent, Option<u64>)> = evs
+                .into_iter()
+                .map(|ev| {
+                    let t = match ev {
+                        ReadEvent::Requested { read_index, .. } => s.raft.log().term_at(read_index),
+                        ReadEvent::Served { .. } => None,
+                    };
+                    (ev, t)
+                })
+                .collect();
+            for (ev, index_term) in events {
                 match ev {
-                    ReadEvent::Requested { id, read_index } => {
-                        self.pending_reads
-                            .insert((node, id), (read_index, committed_before));
+                    ReadEvent::Requested {
+                        id,
+                        read_index,
+                        term,
+                        seq,
+                    } => {
+                        // The rule behind the first ReadIndex condition, stated
+                        // directly: a leader's commit index only covers what
+                        // earlier leaders committed once it has committed an
+                        // entry of its own term, so the entry at the read index
+                        // must carry that term. Waiting for a stale value to
+                        // reach a client caught this one seed in fifteen.
+                        if let Some(t) = index_term {
+                            if t != term {
+                                self.report.add(Violation::new(
+                                    "read_before_term_commit",
+                                    now,
+                                    Some(node),
+                                    format!(
+                                        "accepted a read in term {term} at index {read_index}, \
+                                         whose entry is from term {t}: no entry of its own \
+                                         term is committed yet"
+                                    ),
+                                ));
+                            }
+                        }
+                        self.pending_reads.insert(
+                            (node, id),
+                            PendingRead {
+                                read_index,
+                                term,
+                                committed_before,
+                                leader_term_before: self.max_leader_term,
+                                seq,
+                                // A cluster of one is its own quorum.
+                                confirmed: sole_member,
+                            },
+                        );
                     }
                     ReadEvent::Served { id } => {
-                        let Some((read_index, needed)) = self.pending_reads.remove(&(node, id))
-                        else {
+                        let Some(read) = self.pending_reads.remove(&(node, id)) else {
                             continue;
                         };
+                        // The second ReadIndex condition as a rule: before the
+                        // answer, a quorum of the leader's configuration must
+                        // have replied to a probe sent after the read arrived.
+                        // Counted from delivered messages, so it holds whether
+                        // or not the leader has been deposed, and whether or not
+                        // anything changed for the answer to be stale against.
+                        if !read.confirmed {
+                            self.report.add(Violation::new(
+                                "read_unconfirmed",
+                                now,
+                                Some(node),
+                                format!(
+                                    "served a read accepted in term {} without a quorum \
+                                     answering any probe from sequence {} on",
+                                    read.term, read.seq
+                                ),
+                            ));
+                        }
+                        // The second condition: leadership confirmed by a
+                        // quorum after the read arrived. If a later term
+                        // already had a leader by then, the quorum that elected
+                        // it had moved past this term, and no quorum could have
+                        // confirmed this leader -- so a read it served was
+                        // never confirmed at all, whether or not anything has
+                        // been written since for it to be stale against.
+                        if read.leader_term_before > read.term {
+                            self.report.add(Violation::new(
+                                "read_by_deposed_leader",
+                                now,
+                                Some(node),
+                                format!(
+                                    "served a read accepted in term {}, after a leader of \
+                                     term {} had already been elected",
+                                    read.term, read.leader_term_before
+                                ),
+                            ));
+                        }
+                        let (read_index, needed) = (read.read_index, read.committed_before);
                         if read_index < needed {
                             self.report.add(Violation::new(
                                 "stale_read_index",
@@ -762,6 +920,11 @@ impl Cluster {
             let i = v.id.idx();
             if v.up && v.durable_index > self.durable_high_water[i] {
                 self.durable_high_water[i] = v.durable_index;
+            }
+        }
+        for v in &views {
+            if v.up && v.role == Role::Leader {
+                self.max_leader_term = self.max_leader_term.max(v.term);
             }
         }
         let found = self.invariants.observe(now, &views);

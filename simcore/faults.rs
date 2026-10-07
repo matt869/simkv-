@@ -30,6 +30,13 @@ pub enum FaultAction {
     Partition(Vec<Vec<NodeId>>),
     /// Isolate a single node in both directions.
     Isolate(NodeId),
+    /// Cut a node off from every other server, but not from clients.
+    ///
+    /// A full isolation hides a deposed leader from its clients as well as its
+    /// peers, so it never gets the chance to answer a read it should not. This
+    /// is the split that makes stale reads possible: the server network is
+    /// down, the client network is fine.
+    IsolateFromPeers(NodeId),
     /// Degrade one direction of one link.
     SlowLink(NodeId, NodeId),
     /// Repair every link.
@@ -57,6 +64,10 @@ pub struct FaultConfig {
     pub restart_weight: u32,
     pub partition_weight: u32,
     pub isolate_weight: u32,
+    /// Weight of `IsolateFromPeers`. Zero leaves it off the menu entirely, so
+    /// the random stream -- and every seed's schedule -- is exactly what it was
+    /// before the fault existed.
+    pub peer_isolate_weight: u32,
     pub slow_link_weight: u32,
     pub clock_jump_weight: u32,
     pub reconfig_weight: u32,
@@ -105,6 +116,7 @@ impl Default for FaultConfig {
             restart_weight: 40,
             partition_weight: 20,
             isolate_weight: 15,
+            peer_isolate_weight: 10,
             slow_link_weight: 10,
             clock_jump_weight: 5,
             reconfig_weight: 15,
@@ -178,6 +190,7 @@ pub struct FaultStats {
     pub restarts: u64,
     pub partitions: u64,
     pub isolations: u64,
+    pub peer_isolations: u64,
     pub heals: u64,
     pub clock_jumps: u64,
     pub slow_links: u64,
@@ -312,6 +325,9 @@ impl FaultInjector {
         if c.enable_partitions && n >= 2 {
             menu.push((c.partition_weight, FaultChoice::Partition));
             menu.push((c.isolate_weight, FaultChoice::Isolate));
+            if c.peer_isolate_weight > 0 {
+                menu.push((c.peer_isolate_weight, FaultChoice::IsolateFromPeers));
+            }
             menu.push((c.heal_weight, FaultChoice::Heal));
         }
         if c.enable_slow_links && n >= 2 {
@@ -374,6 +390,20 @@ impl FaultInjector {
                 };
                 FaultAction::Isolate(target)
             }
+            FaultChoice::IsolateFromPeers => {
+                self.stats.peer_isolations += 1;
+                // Aimed at the leader for the same reason as a full isolation,
+                // and more so: a cut-off follower answers nothing, a cut-off
+                // leader goes on believing it leads.
+                let target = match leader {
+                    Some(l) if rng.chance_ppm(c.leader_bias_ppm) => {
+                        self.stats.leader_targeted += 1;
+                        l
+                    }
+                    _ => NodeId(rng.below(n as u64) as u32),
+                };
+                FaultAction::IsolateFromPeers(target)
+            }
             FaultChoice::Heal => {
                 self.stats.heals += 1;
                 FaultAction::HealNetwork
@@ -416,6 +446,7 @@ enum FaultChoice {
     Restart,
     Partition,
     Isolate,
+    IsolateFromPeers,
     Heal,
     SlowLink,
     ClockJump,

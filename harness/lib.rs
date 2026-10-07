@@ -423,13 +423,25 @@ mod tests {
         assert_eq!(find_failure(InjectedBug::None, 400), None);
     }
 
+    /// A seed pinned to the fault model it was found under.
+    ///
+    /// Every fault added later reshuffles every seed's schedule, and a
+    /// regression seed that no longer reaches its bug's state passes whether
+    /// the fix is there or not. Faults added after a seed was found are
+    /// switched off here, so each one keeps reproducing its own bug.
+    fn regression_seed(seed: u64) -> SimConfig {
+        let mut cfg = SimConfig::with_seed(seed);
+        cfg.faults.peer_isolate_weight = 0;
+        cfg
+    }
+
     #[test]
     fn a_follower_only_acknowledges_what_it_has_verified() {
         // Regression for the matchIndex bug. With two-entry batches, a follower
         // used to acknowledge its whole durable log -- including an older-term
         // suffix the leader had never compared -- and the leader committed
         // entries that follower did not hold. Seed 388 overwrote committed data.
-        let mut cfg = SimConfig::with_seed(388);
+        let mut cfg = regression_seed(388);
         cfg.raft.max_batch = 2;
         cfg.duration = 8 * SECONDS;
         cfg.settle = 12 * SECONDS;
@@ -440,7 +452,7 @@ mod tests {
     }
 
     fn snapshot_regression(seed: u64, threshold: u64, servers: usize, max_batch: usize) {
-        let mut cfg = SimConfig::with_seed(seed);
+        let mut cfg = regression_seed(seed);
         cfg.servers = servers;
         cfg.raft.snapshot_threshold = threshold;
         cfg.raft.max_batch = max_batch;
@@ -475,7 +487,7 @@ mod tests {
         // the hard state, so the send guard withheld every reply it owed the
         // leader -- whose retries kept its election timer quiet. The cluster
         // stalled for good with a live leader and a live quorum.
-        let mut cfg = SimConfig::with_seed(392).with_reconfig(2);
+        let mut cfg = regression_seed(392).with_reconfig(2);
         cfg.raft.snapshot_threshold = 5;
         cfg.raft.max_batch = 2;
         cfg.normalise();
@@ -489,7 +501,7 @@ mod tests {
         // write was in flight. The term had been durable for a while, so the
         // term-only send guard let the repeat grant out before the vote itself
         // reached disk -- a crash there would forget a vote already cast.
-        let mut cfg = SimConfig::with_seed(480).with_reconfig(2);
+        let mut cfg = regression_seed(480).with_reconfig(2);
         cfg.normalise();
         let out = run(cfg);
         assert!(!out.failed(), "{}", out.detail());
